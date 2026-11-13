@@ -380,10 +380,14 @@ class _KVCRCore:
 
     def start(self) -> None:
         self._progress.start()
+        if self._g4 is not None:
+            self._g4.start(self._progress._startup_budget())
 
     def is_quiescent(self) -> bool:
         """Report whether native progress can still access backend resources."""
-        return self._progress.is_quiescent()
+        return self._progress.is_quiescent() and (
+            self._g4 is None or self._g4.is_quiescent()
+        )
 
     def adopt_recovery_records(self, records: dict[BlockKey, _BlockRecord]) -> None:
         """Seed a core that has not started with recovered residencies.
@@ -962,6 +966,12 @@ class _KVCRCore:
             self._progress.close()
         except BaseException as error:  # noqa: BLE001 - re-raised below
             progress_error = error
+        if self._g4 is not None:
+            try:
+                self._g4.close_workers()
+            except BaseException as error:  # noqa: BLE001 - re-raised below
+                if progress_error is None:
+                    progress_error = error
 
         # Shutdown can observe native completion after the last public poll.
         # Deliver those lifecycle notifications before returning any memory.

@@ -16,10 +16,15 @@ from typing import Annotated, Any
 
 import msgspec
 import numpy as np
-from nixl import nixl_agent, nixl_agent_config, nixlRemoteDisconnectError
 
 from .. import _nvtx
 from ..types import BlockKey, OpEntryResult, OpEntryStatus, RegionDescriptor
+from .nixl_module import load_nixl
+
+_nixl = load_nixl()
+nixl_agent = _nixl.nixl_agent
+nixl_agent_config = _nixl.nixl_agent_config
+nixlRemoteDisconnectError = _nixl.nixlRemoteDisconnectError
 
 logger = logging.getLogger(__name__)
 _SUCCESS_RESULT = OpEntryResult(OpEntryStatus.SUCCESS)
