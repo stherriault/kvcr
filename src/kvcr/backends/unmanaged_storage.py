@@ -17,6 +17,7 @@ proves quiescence because OBJ handles carry one descriptor and POSIX uses
 linux AIO only.
 """
 
+import atexit
 import contextlib
 import hashlib
 import logging
@@ -69,6 +70,9 @@ _OBJ_DEVID_BASE = 1 << 32
 _IDLE_WAIT_SECONDS = 0.0005
 _WAKE_SECONDS = 0.05
 _COUNTED_BATCHES = 1024
+# NIXL 1.5.0 OBJ query_memory waits up to 30 s per HEAD, one after another.
+_QUERY_SECONDS_PER_ROW = 30.0
+_QUERY_MARGIN_SECONDS = 5.0
 _STOP = object()
 _FETCHING = (QueryStatus.FETCHING, CacheTier.G4)
 _FETCHABLE = (QueryStatus.FETCHABLE, CacheTier.G4)
@@ -211,6 +215,7 @@ class _StorageWorker:
         self._dram_regs: list[Any] = []
         self._next_devid = _OBJ_DEVID_BASE
         self._next_batch = 0
+        self.blocked_until: float | None = None
         self.thread = threading.Thread(
             target=self._run, daemon=True, name="kvcr-g4-storage"
         )
@@ -436,6 +441,11 @@ class _StorageWorker:
             job.started = True
             job.batch = self._next_batch
         rows = [(0, g4._payload_len, 0, job.name) for job in jobs]
+        self.blocked_until = (
+            time.monotonic()
+            + len(rows) * _QUERY_SECONDS_PER_ROW
+            + _QUERY_MARGIN_SECONDS
+        )
         try:
             answers = list(self.agent.query_memory(rows, g4._backend, mem_type="OBJ"))
             if len(answers) != len(rows):
@@ -444,6 +454,8 @@ class _StorageWorker:
         except Exception:
             logger.debug("KVCR G4 existence check failed", exc_info=True)
             results = ["error"] * len(rows)
+        finally:
+            self.blocked_until = None
         for job, result in zip(jobs, results, strict=True):
             job.result = result
             g4._check_done.put(job)
@@ -1250,7 +1262,22 @@ class _G4:
         ):
             if worker.thread.ident is not None:
                 worker.thread.join(timeout=bound)
-        if self._storage.thread.is_alive():
+        storage = self._storage
+        # A blocking query_memory has a known upper bound; wait it out.
+        while storage.thread.is_alive():
+            blocked_until = storage.blocked_until
+            remaining = (
+                None if blocked_until is None else blocked_until - time.monotonic()
+            )
+            if remaining is None or remaining <= 0:
+                break
+            storage.thread.join(timeout=remaining)
+        if storage.thread.is_alive():
+            # Exiting while the agent's native threads still run aborts the
+            # process; give the worker the same budget again at exit.
+            atexit.register(
+                storage.thread.join, timeout + _progress._JOIN_TIMEOUT_SECONDS
+            )
             raise RuntimeError("G4 storage worker did not stop")
         if self._file.thread.is_alive():
             raise RuntimeError("G4 file worker did not stop")
