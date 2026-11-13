@@ -521,6 +521,7 @@ class _G4:
         self._op_done: queue.SimpleQueue[_Xfer] = queue.SimpleQueue()
         self._checks: dict[BlockKey, _Check] = {}
         self._pending_start: deque[BlockKey] = deque()
+        self._timed_out: dict[BlockKey, _CheckJob] = {}
         self._pending_count = 0
         self._inflight = 0
         self._sub_count = 0
@@ -634,9 +635,14 @@ class _G4:
                 and now >= check.deadline
             ):
                 self._resolve_check(key, check, False)
+                # The job still runs; until its late answer is dropped the key
+                # answers MISS instead of queueing behind it.
+                self._timed_out[key] = check.job
         self._start_pending(now)
 
     def _apply_check(self, job: _CheckJob) -> None:
+        if self._timed_out.get(job.key) is job:
+            del self._timed_out[job.key]
         check = self._checks.get(job.key)
         if check is None or check.job is not job:
             return
@@ -688,7 +694,7 @@ class _G4:
         check = self._checks.get(key)
         if check is not None and owner in check.subscribers:
             return _FETCHING
-        if self._closing:
+        if self._closing or key in self._timed_out:
             return _MISS
         held = self._sub_count + self._pending_count + len(self._results)
         if held >= self._options.max_check_results:
@@ -722,6 +728,17 @@ class _G4:
                 if not keys:
                     del self._owner_keys[owner]
         return present
+
+    def discard_owner(self, owner: str) -> None:
+        for key in self._owner_keys.pop(owner, ()):
+            self._results.pop((owner, key), None)
+            check = self._checks.get(key)
+            if check is not None and owner in check.subscribers:
+                check.subscribers.discard(owner)
+                self._sub_count -= 1
+                if not check.subscribers and check.job is None:
+                    del self._checks[key]
+                    self._pending_count -= 1
 
     # Reads.
 
@@ -1033,6 +1050,7 @@ class _G4:
                     op.results[key] = _FAILED_RESULT
                 self._kvcr._complete(op.handle, op.results)
         self._checks.clear()
+        self._timed_out.clear()
         self._pending_start.clear()
         self._results.clear()
         self._owner_keys.clear()
