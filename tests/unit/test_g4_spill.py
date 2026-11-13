@@ -242,7 +242,7 @@ def test_g4_overwriting_spill_leaves_a_complete_block(g4env, tmp_path):
     w = new_world(g4env, tmp_path, flavor="file")
     w.spill(A, 0)
     w.fill(0, b"\x42" * PAGE)
-    assert w.deposit(A, 0).success
+    assert w.wait(w.kvcr.deposit({A: [w.ref(0)]}))[A].success
     assert w.deposit(B, 1).success
     w.poll_until(lambda: not tmp_files(w.root) and not w.storage.unreleased())
     (final,) = find_files(w.root, A)
@@ -307,7 +307,9 @@ def test_g4_deadline_counts_once_per_operation(g4env, tmp_path):
     w.settle()
     w.storage.finish_all("ERR")
     assert not w.wait(handle)[A].success
-    assert w.kvcr.query([BlockKey(b"fresh")], "r")[0] == fetching_g4()
+    calls = w.check_calls()
+    assert w.await_check(BlockKey(b"fresh"), "r") == MISS
+    assert w.check_calls() == calls + 1
     w.storage.outcome["READ"] = "ERR"
     w.advance(10.0)
     _fail_reads(w, A, 1)

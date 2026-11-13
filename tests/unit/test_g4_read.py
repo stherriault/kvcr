@@ -552,7 +552,8 @@ def test_g4_fetch_deadline_then_late_done_completes_the_fill_once_as_failed(
         w.local_dram, "complete_fill", wraps=w.local_dram.complete_fill
     ) as spy:
         handle = w.fetch(A)
-        wait_for(lambda: len(w.storage.held("READ")) == 1)
+        # The fetch first spills the filler; its READ starts after that completion.
+        w.poll_until(lambda: len(w.storage.held("READ")) == 1)
         w.advance(2.0)
         assert not w.wait(handle)[A].success
         assert spy.call_count == 0

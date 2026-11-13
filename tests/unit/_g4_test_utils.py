@@ -621,8 +621,12 @@ class World:
 
     def deposit(self, key: BlockKey, index: int, *, wait: bool = True):
         self.fill(index)
-        handle = self.kvcr.deposit({key: [_mem_descriptor(index)]})
+        handle = self.kvcr.deposit({key: [self.ref(index)]})
         return self.wait(handle)[key] if wait else handle
+
+    def ref(self, index: int, label: str = ""):
+        name = self.kvcr.config.nixl_agent_name
+        return _mem_descriptor(index, label, end_point_name=name)
 
     def start_spill(self, key: BlockKey, index: int) -> int:
         """Deposit key, then a filler that evicts it; return the filler handle."""
@@ -653,7 +657,7 @@ class World:
             time.sleep(0.001)
 
     def deliver(self, key: BlockKey, index: int, rid: str = "r") -> int:
-        return self.kvcr.deliver({key: [_mem_descriptor(index)]}, rid)
+        return self.kvcr.deliver({key: [self.ref(index)]}, rid)
 
     def fetch(self, key: BlockKey, rid: str = "r") -> int:
         return self.kvcr.fetch((key,), rid)

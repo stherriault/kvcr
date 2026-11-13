@@ -20,6 +20,7 @@ from kvcr.types import BlockKey
 
 A = BlockKey(b"block-a")
 B = BlockKey(b"block-b")
+C = BlockKey(b"block-c")
 
 
 def _open_fds_under(root):
@@ -53,7 +54,10 @@ def _pending_start(w, mp):
 
 def _spill_queued_unstarted(w, mp):
     assert w.deposit(A, 0).success
-    release = _check_in_flight(w, mp)
+    gate = w.hold_checks()
+    assert w.kvcr.query([C], "r") == [fetching_g4()]
+    wait_for(lambda: w.blocked_checks() == 1)
+    release = gate.set
     w.deposit(B, 1, wait=False)
     w.settle(5)
     assert w.storage.log("WRITE") == []

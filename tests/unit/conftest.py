@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import inspect
 import logging
 
 import pytest
@@ -49,21 +50,40 @@ def g4env(monkeypatch):
     env.release_all()
 
 
-_DROP2_WORDS = ("obj", "object", "aws", "nixl_module", "head", "probe", "devid")
+_DROP2_WORDS = ("obj", "aws", "nixl_module", "head", "probe", "devid")
+# Tests that need miss backoff (D5, not in drop 1): run with -m pending_d5.
+_PENDING_D5 = (
+    "miss_backoff_suppresses_repeat_checks",
+    "own_publish_clears_the_miss_backoff",
+)
 
 
 def pytest_configure(config):
-    config.addinivalue_line("markers", "drop1: G4 file flavor delivery drop")
-    config.addinivalue_line("markers", "drop2: G4 OBJ flavor delivery drop")
+    config.addinivalue_line("markers", "drop1: G4 file flavor and flavor-neutral core")
+    config.addinivalue_line("markers", "drop2: G4 OBJ flavor")
+    config.addinivalue_line("markers", "pending_d5: needs miss backoff (D5)")
+
+
+def _is_object_test(item) -> bool:
+    flavor = getattr(getattr(item, "callspec", None), "params", {}).get("flavor")
+    if flavor is not None:
+        return flavor == "object"
+    name = item.originalname or item.name
+    if any(word in name for word in _DROP2_WORDS):
+        return True
+    # A test that builds an OBJ world or options by literal is an OBJ test.
+    return '"object"' in inspect.getsource(item.function)
 
 
 def pytest_collection_modifyitems(items):
-    """Tag G4 tests by delivery drop: file flavor is drop 1, OBJ is drop 2."""
+    """Tag G4 tests: drop 1 is file flavor plus flavor-neutral core, drop 2 is OBJ."""
     for item in items:
         if not item.fspath.basename.startswith("test_g4_"):
             continue
-        flavor = getattr(getattr(item, "callspec", None), "params", {}).get("flavor")
-        if flavor is None:
-            name = item.originalname or item.name
-            flavor = "object" if any(w in name for w in _DROP2_WORDS) else "file"
-        item.add_marker(pytest.mark.drop2 if flavor == "object" else pytest.mark.drop1)
+        name = item.originalname or item.name
+        if any(name.endswith(pending) for pending in _PENDING_D5):
+            item.add_marker(pytest.mark.pending_d5)
+            continue
+        item.add_marker(
+            pytest.mark.drop2 if _is_object_test(item) else pytest.mark.drop1
+        )
