@@ -6,12 +6,12 @@ import atexit
 import threading
 
 import pytest
-from _g4_test_utils import fetching_g4, new_world, wait_for
+from _g4_test_utils import digest, fetching_g4, new_world, wait_for
 from _kvcr_test_utils import _OPEN_KVCRS
 
 from kvcr.backends import unmanaged_storage
 from kvcr.runtime import progress
-from kvcr.types import BlockKey
+from kvcr.types import BlockKey, QueryStatus
 
 KEY = BlockKey(b"hung-head")
 
@@ -71,3 +71,19 @@ def test_g4_close_past_the_query_bound_raises_and_joins_at_exit(
     assert w.kvcr._core.is_quiescent()
     assert w.storage.leaks() == []
     _OPEN_KVCRS.remove(w.kvcr)
+
+
+def test_g4_opening_the_breaker_cancels_timed_out_checks_queued_behind_a_hung_call(
+    g4env, tmp_path
+):
+    w = new_world(g4env, tmp_path, flavor="object", failure_threshold=2)
+    keys = [BlockKey(b"queued-%d" % i) for i in range(3)]
+    gate = _hung_check(w)
+    assert w.kvcr.query(keys, "r") == [fetching_g4()] * 3
+    # The hung check and the queued ones time out; two counts open the breaker.
+    w.advance(1.5)
+    assert w.kvcr.query(keys, "r") == [(QueryStatus.MISS, None)] * 3
+    gate.set()
+    w.settle()
+    # Only the hung call reached storage; the queued checks were dropped.
+    assert w.check_names() == [digest(KEY)]

@@ -842,6 +842,11 @@ class _G4:
                 continue
             if check.job is None or self._try_cancel(check.job):
                 self._resolve_check(key, check, False)
+        # Timed-out checks still queued behind a hung call would each block the
+        # worker again while storage is down.
+        for key, job in tuple(self._timed_out.items()):
+            if self._try_cancel(job):
+                del self._timed_out[key]
 
     def _start_pending(self, now: float) -> None:
         while (
