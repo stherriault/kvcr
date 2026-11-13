@@ -17,9 +17,14 @@ proves quiescence because OBJ handles carry one descriptor and POSIX uses
 linux AIO only.
 """
 
+import contextlib
 import hashlib
 import logging
+import os
 import queue
+import secrets
+import socket
+import stat
 import threading
 import time
 from collections import OrderedDict, deque
@@ -40,12 +45,16 @@ from ..runtime.progress import (
 )
 from ..types import (
     BlockKey,
+    BlockMeta,
     CacheTier,
     OpEntryResult,
     OpHandle,
+    PlacementAction,
+    PlacementDecision,
+    PlacementFailure,
     QueryStatus,
 )
-from .local_dram_pools import _layout_indices
+from .local_dram_pools import _layout_indices, _LocalDramState
 
 if TYPE_CHECKING:
     from ..runtime.core import _KVCRCore
@@ -59,6 +68,7 @@ _STOP = object()
 _FETCHING = (QueryStatus.FETCHING, CacheTier.G4)
 _FETCHABLE = (QueryStatus.FETCHABLE, CacheTier.G4)
 _MISS = (QueryStatus.MISS, None)
+_FALSE_VALUES = ("", "0", "false", "no", "off")
 
 
 @dataclass(eq=False)
@@ -89,11 +99,14 @@ class _Xfer:
     local: list[tuple[int, int, int]]
     remote: list[tuple[int, int]]
     refs: list[_TransferRef]
+    tmp: str | None = None
     fd: int | None = None
+    fd_closed: bool = False
     reg: Any = None
     handle: Any = None
     start_failed: bool = False
     outcome: Literal["", "DONE", "ERR", "ABSENT", "PUBLISH_ERR"] = ""
+    published: bool = False
     finished: bool = False
 
 
@@ -323,11 +336,109 @@ class _FileWorker:
         self.queue.put(_STOP)
 
     def _run(self) -> None:
+        g4 = self._g4
         while True:
             job = self.queue.get()
             # Close drops every job still queued.
             if job is _STOP or self.stopping:
                 return
+            try:
+                if isinstance(job, _CheckJob):
+                    if g4._try_start(job):
+                        self._check(job)
+                elif job.handle is None and not job.start_failed:
+                    self._open(job)
+                else:
+                    self._finish(job)
+            except Exception:
+                logger.exception("KVCR G4 file worker job failed")
+
+    def _check(self, job: _CheckJob) -> None:
+        try:
+            info = os.stat(job.name)
+        except FileNotFoundError:
+            job.result = "absent"
+        except OSError:
+            job.result = "error"
+        else:
+            job.result = (
+                "present"
+                if stat.S_ISREG(info.st_mode) and info.st_size == self._g4._payload_len
+                else "absent"
+            )
+        self._g4._check_done.put(job)
+
+    def _open(self, xfer: _Xfer) -> None:
+        g4 = self._g4
+        direct = os.O_DIRECT if g4._options.direct_io else 0
+        if xfer.op.kind == "spill":
+            try:
+                g4._make_dirs(os.path.dirname(xfer.name))
+                xfer.fd = os.open(
+                    xfer.tmp,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | direct,
+                    0o644,
+                )
+                os.ftruncate(xfer.fd, g4._payload_len)
+            except OSError:
+                logger.warning("KVCR G4 spill file could not open", exc_info=True)
+                xfer.start_failed = True
+                xfer.outcome = "ERR"
+                self._finish(xfer)
+                return
+            g4._storage.submit(xfer)
+            return
+        try:
+            fd = os.open(xfer.name, os.O_RDONLY | os.O_CLOEXEC | direct)
+        except FileNotFoundError:
+            xfer.outcome = "ABSENT"
+            g4._op_done.put(xfer)
+            return
+        except OSError:
+            logger.warning("KVCR G4 block file could not open", exc_info=True)
+            xfer.outcome = "ERR"
+            g4._op_done.put(xfer)
+            return
+        xfer.fd = fd
+        try:
+            size = os.fstat(fd).st_size
+        except OSError:
+            xfer.outcome = "ERR"
+            self._finish(xfer)
+            return
+        if size != g4._payload_len:
+            xfer.outcome = "ABSENT"
+            self._finish(xfer)
+            return
+        g4._storage.submit(xfer)
+
+    def _close_fd(self, xfer: _Xfer) -> None:
+        if xfer.fd is not None and not xfer.fd_closed:
+            xfer.fd_closed = True
+            os.close(xfer.fd)
+
+    def _finish(self, xfer: _Xfer) -> None:
+        if xfer.op.kind == "spill" and xfer.tmp is not None:
+            if xfer.outcome == "DONE":
+                try:
+                    os.fsync(xfer.fd)
+                    self._close_fd(xfer)
+                    os.rename(xfer.tmp, xfer.name)
+                    xfer.published = True
+                except OSError:
+                    logger.warning("KVCR G4 spill publish failed", exc_info=True)
+                    xfer.outcome = "PUBLISH_ERR"
+            if not xfer.published:
+                with contextlib.suppress(OSError):
+                    self._close_fd(xfer)
+                with contextlib.suppress(OSError):
+                    os.unlink(xfer.tmp)
+        else:
+            try:
+                self._close_fd(xfer)
+            except OSError:
+                logger.warning("KVCR G4 block file close failed", exc_info=True)
+        self._g4._op_done.put(xfer)
 
 
 class _G4:
@@ -388,10 +499,22 @@ class _G4:
             if options.root is None:
                 raise ValueError("G4 file flavor requires a root directory")
             self._backend = options.backend or "POSIX"
+            for name in ("use_uring", "use_posix_aio"):
+                if params.get(name, "").lower() not in _FALSE_VALUES:
+                    raise ValueError(f"G4 file flavor rejects POSIX {name}")
+            if params.get("use_aio", "true").lower() in _FALSE_VALUES:
+                raise ValueError("G4 file flavor requires POSIX use_aio")
+            params["use_aio"] = "true"
             self._root = Path(options.root)
+            if not self._root.is_dir():
+                raise ValueError(f"G4 root {self._root} is not a directory")
+            self._probe_root()
         self._backend_params = params
         self._check_timeout = (
             options.check_timeout_ms or config.operation_timeout_ms
+        ) / 1000
+        self._spill_timeout = (
+            options.spill_timeout_ms or config.operation_timeout_ms
         ) / 1000
         self._job_lock = threading.Lock()
         self._check_done: queue.SimpleQueue[_CheckJob] = queue.SimpleQueue()
@@ -404,16 +527,50 @@ class _G4:
         self._results: OrderedDict[tuple[str, BlockKey], bool] = OrderedDict()
         self._owner_keys: dict[str, set[BlockKey]] = {}
         self._ops: dict[_OpId, _G4Op] = {}
+        self._pending_spills: set[BlockKey] = set()
         self._closing = False
+        self.spill_dropped = 0
         self._storage = _StorageWorker(self)
         self._file = _FileWorker(self)
 
     # Startup and naming.
 
+    def _probe_root(self) -> None:
+        directory = self._root / self._prefix / self._layout_tag
+        directory.mkdir(parents=True, exist_ok=True)
+        tmp = directory / f".probe.tmp.{self._temp_suffix()}"
+        final = directory / f".probe.{self._temp_suffix()}"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC, 0o644)
+        try:
+            try:
+                os.write(fd, b"kvcr-g4")
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            os.rename(tmp, final)
+            os.unlink(final)
+        finally:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
+
+    @staticmethod
+    def _temp_suffix() -> str:
+        return f"{socket.gethostname()}.{os.getpid()}.{secrets.randbits(64):016x}"
+
     def _name(self, key: BlockKey) -> str:
         digest = hashlib.sha256(bytes(key)).hexdigest()
         name = f"{self._prefix}/{self._layout_tag}/{digest[:2]}/{digest}"
         return name if self._root is None else str(self._root / name)
+
+    def _make_dirs(self, path: str) -> None:
+        try:
+            os.mkdir(path)
+        except FileExistsError:
+            return
+        except FileNotFoundError:
+            self._make_dirs(os.path.dirname(path))
+            with contextlib.suppress(FileExistsError):
+                os.mkdir(path)
 
     def _dram_regions(self):
         return [
@@ -652,6 +809,98 @@ class _G4:
         if not op.xfers:
             self._kvcr._complete(op_handle, op.results)
 
+    # Spills.
+
+    def resolve_eviction(
+        self,
+        meta: BlockMeta,
+        source: CacheTier,
+        decision: PlacementDecision,
+        deadline: float,
+    ) -> tuple[PlacementDecision, bool]:
+        """Start a LOCAL_G2 -> G4 spill; the deposit deadline does not bound it."""
+        if source is not CacheTier.LOCAL_G2 or decision != (
+            PlacementAction.MOVE_TO,
+            CacheTier.G4,
+        ):
+            return decision, False
+        core = self._kvcr
+        key = meta.block_key
+        record = core._block_record_map.get(key)
+        residency = record.local_dram if record is not None else None
+        if residency is None or key in self._pending_spills:
+            return (PlacementAction.KEEP, None), False
+        complete = (
+            residency.state is _LocalDramState.READY
+            and not residency.pending_labels
+            and residency.key_layout == self._layout
+            and residency.layout == self._layout
+        )
+        op_id = ("g4_spill", key)
+        op = _G4Op(
+            op_id=op_id,
+            keys=frozenset((key,)),
+            kind="spill",
+            deadline=core._clock() + self._spill_timeout,
+        )
+        if self._closing or not complete:
+            self.spill_dropped += 1
+            return (PlacementAction.DROP, None), False
+        sources = core._claim_local_dram_sources(op_id, (key,))
+        if key not in sources:
+            return (PlacementAction.KEEP, None), False
+        refs = list(
+            core._local_dram._pools.source_refs(
+                sources[key], range(len(sources[key].slots))
+            )
+        )
+        local = []
+        for ref in refs:
+            descriptor = core._address_descriptor(ref)
+            local.append((descriptor.addr, descriptor.size, descriptor.device_Id))
+        name = self._name(key)
+        xfer = _Xfer(
+            op,
+            key,
+            name,
+            local,
+            list(zip(self._offsets, self._sizes)),
+            refs,
+            tmp=f"{name}.tmp.{self._temp_suffix()}" if self._root is not None else None,
+        )
+        op.xfers.append(xfer)
+        self._ops[op_id] = op
+        self._pending_spills.add(key)
+        core._add_block_dependencies(op, new_operation=True)
+        self._launch(xfer)
+        return (PlacementAction.KEEP, None), True
+
+    def _retire_source(self, op: _G4Op) -> None:
+        core = self._kvcr
+        sources = core._local_dram_sources_by_op.get(op.op_id)
+        if sources:
+            core._local_dram._pools.retire_sources(sources)
+            core._release_local_dram_sources(op.op_id)
+
+    def _recover_spill_failure(self, op: _G4Op, key: BlockKey, reason: str) -> None:
+        core = self._kvcr
+        record = core._block_record_map.get(key)
+        if record is not None and record.local_dram is not None:
+            core._policy.decide_recovery(
+                core._block_meta(
+                    key,
+                    record,
+                    core._local_dram._pools._size_bytes(record.local_dram),
+                ),
+                PlacementFailure(
+                    attempted=(PlacementAction.MOVE_TO, CacheTier.G4),
+                    source=CacheTier.LOCAL_G2,
+                    reason=reason,
+                    failure_count=1,
+                ),
+            )
+        self._retire_source(op)
+
     # Completion pump.
 
     def poll_main(self) -> None:
@@ -678,6 +927,9 @@ class _G4:
             return
         xfer.finished = True
         outcome = xfer.outcome
+        if op.kind == "spill":
+            self._finish_spill(op, xfer)
+            return
         done = outcome == "DONE" and not op.latched
         if op.kind == "fill":
             self._kvcr._local_dram.complete_fill(
@@ -695,6 +947,24 @@ class _G4:
             if op.kind == "deliver":
                 self._kvcr._complete(op.handle, op.results)
         self._ops.pop(op.op_id)
+
+    def _finish_spill(self, op: _G4Op, xfer: _Xfer) -> None:
+        core = self._kvcr
+        self._ops.pop(op.op_id)
+        self._pending_spills.discard(xfer.key)
+        try:
+            if xfer.outcome == "DONE" and (self._root is None or xfer.published):
+                self._retire_source(op)
+            else:
+                if xfer.outcome == "PUBLISH_ERR":
+                    reason = "publish failed"
+                elif xfer.start_failed:
+                    reason = "start failed"
+                else:
+                    reason = "transfer failed"
+                self._recover_spill_failure(op, xfer.key, reason)
+        finally:
+            core._remove_block_dependencies(op)
 
     # Close.
 
@@ -742,7 +1012,20 @@ class _G4:
                     continue
                 xfer.finished = True
                 open_keys.append(xfer.key)
-            if op.kind == "fill":
+                if xfer.fd is not None and not xfer.fd_closed:
+                    xfer.fd_closed = True
+                    with contextlib.suppress(OSError):
+                        os.close(xfer.fd)
+                if xfer.tmp is not None and not xfer.published:
+                    with contextlib.suppress(OSError):
+                        os.unlink(xfer.tmp)
+            if op.kind == "spill":
+                self._pending_spills.difference_update(op.keys)
+                self._kvcr._release_local_dram_sources(op.op_id)
+                for key in op.keys:
+                    local._pools.abandon_capacity_eviction(key)
+                self._kvcr._remove_block_dependencies(op)
+            elif op.kind == "fill":
                 if open_keys:
                     local.complete_fill(open_keys, success=False, source=CacheTier.G4)
             else:
