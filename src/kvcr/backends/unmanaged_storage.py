@@ -64,6 +64,8 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _FORMAT_VERSION = 1
+# OBJ devIds live above every DRAM device id so the two never collide.
+_OBJ_DEVID_BASE = 1 << 32
 _IDLE_WAIT_SECONDS = 0.0005
 _WAKE_SECONDS = 0.05
 _COUNTED_BATCHES = 1024
@@ -80,6 +82,7 @@ class _CheckJob:
 
     key: BlockKey
     name: str
+    probe_op: "_G4Op | None" = None
     started: bool = False
     cancelled: bool = False
     batch: int | None = None
@@ -122,6 +125,7 @@ class _G4Op(_Op):
     abandon_deadline: float | None = None
     xfers: list[_Xfer] = field(default_factory=list)
     results: dict[BlockKey, OpEntryResult] = field(default_factory=dict)
+    probes: int = 0
     ended: bool = False
     latched: bool = False
     counted: bool = False
@@ -205,6 +209,8 @@ class _StorageWorker:
         self.agent: Any = None
         self.agent_name = f"{g4._kvcr.nixl_agent_name}-g4"
         self._dram_regs: list[Any] = []
+        self._next_devid = _OBJ_DEVID_BASE
+        self._next_batch = 0
         self.thread = threading.Thread(
             target=self._run, daemon=True, name="kvcr-g4-storage"
         )
@@ -243,6 +249,14 @@ class _StorageWorker:
             if backend not in plugins:
                 raise RuntimeError(f"plugin {backend} is not available")
             options = dict(g4._backend_params)
+            if (
+                g4._flavor == "object"
+                and options.get("access_key")
+                and options.get("secret_key")
+                and "AWS_EC2_METADATA_DISABLED" not in os.environ
+            ):
+                # Static credentials make the instance metadata probe pointless.
+                os.environ["AWS_EC2_METADATA_DISABLED"] = "true"
             agent.create_backend(backend, options)
         except Exception as error:
             raise RuntimeError(
@@ -268,25 +282,35 @@ class _StorageWorker:
             self.ready.set()
             return
         self.ready.set()
+        checks: deque[_CheckJob] = deque()
+        probes: deque[_CheckJob] = deque()
         active: list[_Xfer] = []
         close_deadline: float | None = None
         try:
             while True:
                 with self.cond:
-                    if not (self.jobs or active or self.stopping):
+                    if not (self.jobs or active or checks or probes or self.stopping):
                         self.cond.wait(_WAKE_SECONDS)
                     jobs = list(self.jobs)
                     self.jobs.clear()
                     stopping = self.stopping
                 if stopping:
                     # Close drops every job that has not started.
+                    for job in (*jobs, *checks, *probes):
+                        if isinstance(job, _CheckJob):
+                            self._g4._try_cancel(job)
                     jobs = []
+                    checks.clear()
+                    probes.clear()
                     if close_deadline is None:
                         close_deadline = (
                             time.monotonic() + _progress._OP_CLEANUP_TIMEOUT_SECONDS
                         )
                 for job in jobs:
-                    self._start(job, active)
+                    if isinstance(job, _CheckJob):
+                        (probes if job.probe_op is not None else checks).append(job)
+                    else:
+                        self._start(job, active)
                 worked = self._poll(active)
                 if stopping:
                     if not active:
@@ -295,6 +319,12 @@ class _StorageWorker:
                         raise RuntimeError("G4 storage transfers did not finish")
                     time.sleep(_IDLE_WAIT_SECONDS)
                     continue
+                if probes:
+                    self._query((probes.popleft(),))
+                    worked = True
+                elif checks:
+                    self._check_batch(checks)
+                    worked = True
                 if active and not worked:
                     time.sleep(_IDLE_WAIT_SECONDS)
         except BaseException as error:
@@ -317,9 +347,15 @@ class _StorageWorker:
         agent = self.agent
         backend = g4._backend
         try:
-            dev = xfer.fd
-            kind = "FILE"
-            reg_rows = [(0, g4._payload_len, dev, "")]
+            if g4._flavor == "object":
+                dev = self._next_devid
+                self._next_devid += 1
+                kind = "OBJ"
+                reg_rows = [(0, g4._payload_len, dev, xfer.name)]
+            else:
+                dev = xfer.fd
+                kind = "FILE"
+                reg_rows = [(0, g4._payload_len, dev, "")]
             xfer.reg = agent.register_memory(
                 reg_rows, mem_type=kind, backends=[backend]
             )
@@ -383,6 +419,34 @@ class _StorageWorker:
             self._g4._after_storage(xfer)
             worked = True
         return worked
+
+    def _check_batch(self, checks: deque[_CheckJob]) -> None:
+        batch: list[_CheckJob] = []
+        while checks and len(batch) < self._g4._options.check_batch_max:
+            job = checks.popleft()
+            if self._g4._try_start(job):
+                batch.append(job)
+        if batch:
+            self._query(batch)
+
+    def _query(self, jobs: Collection[_CheckJob]) -> None:
+        g4 = self._g4
+        self._next_batch += 1
+        for job in jobs:
+            job.started = True
+            job.batch = self._next_batch
+        rows = [(0, g4._payload_len, 0, job.name) for job in jobs]
+        try:
+            answers = list(self.agent.query_memory(rows, g4._backend, mem_type="OBJ"))
+            if len(answers) != len(rows):
+                raise RuntimeError("query_memory answered the wrong number of rows")
+            results = ["absent" if answer is None else "present" for answer in answers]
+        except Exception:
+            logger.debug("KVCR G4 existence check failed", exc_info=True)
+            results = ["error"] * len(rows)
+        for job, result in zip(jobs, results, strict=True):
+            job.result = result
+            g4._check_done.put(job)
 
 
 class _FileWorker:
@@ -542,6 +606,7 @@ class _G4:
         for name in (
             "max_inflight_checks",
             "max_check_results",
+            "check_batch_max",
             "failure_threshold",
         ):
             if type(getattr(options, name)) is not int or getattr(options, name) < 1:
@@ -722,6 +787,13 @@ class _G4:
         self._start_pending(now)
 
     def _apply_check(self, job: _CheckJob) -> None:
+        op = job.probe_op
+        if op is not None:
+            op.probes -= 1
+            if job.result != "absent":
+                self._count_failure(op)
+            self._end_op_if_done(op)
+            return
         if self._timed_out.get(job.key) is job:
             del self._timed_out[job.key]
         check = self._checks.get(job.key)
@@ -1067,7 +1139,12 @@ class _G4:
             if not op.latched:
                 self._count_success(op)
         elif outcome == "ERR":
-            self._count_failure(op)
+            if self._flavor == "object" and not xfer.start_failed and not op.counted:
+                # A probe decides whether the block vanished or storage failed.
+                op.probes += 1
+                self._storage.submit(_CheckJob(xfer.key, xfer.name, probe_op=op))
+            else:
+                self._count_failure(op)
         if op.kind == "fill":
             self._kvcr._local_dram.complete_fill(
                 (xfer.key,), success=done, source=CacheTier.G4
@@ -1086,6 +1163,8 @@ class _G4:
                     self._report_memory(op, "quiesced")
                 else:
                     self._kvcr._complete(op.handle, op.results)
+        if op.probes:
+            return
         self._ops.pop(op.op_id)
         self._breaker.release(op)
 
