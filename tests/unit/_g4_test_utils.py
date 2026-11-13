@@ -10,7 +10,10 @@ end to end except for the NIXL transfer itself.
 """
 
 import ctypes
+import errno
+import fcntl
 import hashlib
+import mmap
 import os
 import sys
 import threading
@@ -61,6 +64,14 @@ def fetchable_g4():
     return (QueryStatus.FETCHABLE, CacheTier.G4)
 
 
+def aligned(size: int):
+    """Page-aligned ctypes buffer (O_DIRECT needs aligned memory)."""
+    mapping = mmap.mmap(-1, size)
+    buffer = (ctypes.c_char * size).from_buffer(mapping)
+    buffer._mapping = mapping
+    return buffer
+
+
 def wait_for(predicate: Callable[[], bool], *, timeout: float = WAIT_SECONDS) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -109,6 +120,7 @@ class _Xfer:
     local: list[tuple[int, int, int]]
     remote: list[tuple[Any, ...]]
     state: str = "NEW"
+    snapshot: bytes | None = None
     released: bool = False
     deregistered_early: bool = False
 
@@ -150,6 +162,8 @@ class FakeG4Agent:
         self.query_blocked = 0
         self.query_gate: threading.Event | None = None
         self.query_error: Exception | None = None
+        self.query_error_if: Callable[[tuple[str, ...]], bool] | None = None
+        self.fd_direct: list[bool] = []
         self.init_gate: threading.Event | None = None
         self.init_waiting = 0
         self.init_error: Callable[[str], Exception | None] | None = None
@@ -198,6 +212,9 @@ class FakeG4Agent:
                 for row in rows:
                     self.live_fds.add(row[2])
                     reg.fds.append(row[2])
+                    self.fd_direct.append(
+                        bool(fcntl.fcntl(row[2], fcntl.F_GETFL) & os.O_DIRECT)
+                    )
                 self.live_regs.append(reg)
             else:
                 self.dram_regs.append(reg)
@@ -237,6 +254,10 @@ class FakeG4Agent:
                 self.query_blocked -= 1
         if self.query_error is not None:
             raise self.query_error
+        if self.query_error_if is not None and self.query_error_if(
+            tuple(str(row[3]) for row in rows)
+        ):
+            raise RuntimeError("batch rejected")
         return [{} if row[3] in self.store.objects else None for row in rows]
 
     def get_xfer_descs(self, descs, mem_type=None):
@@ -296,6 +317,9 @@ class FakeG4Agent:
             self.before_transfer(xfer)
         outcome = self._next_outcome(xfer.op)
         if outcome == "HOLD":
+            if xfer.kind == "OBJ" and xfer.op == "READ":
+                name = self.live_dev[xfer.remote[0][2]]
+                xfer.snapshot = self.store.objects.get(name)
             xfer.state = "PROC"
             return "PROC"
         self._complete(xfer, outcome)
@@ -340,17 +364,22 @@ class FakeG4Agent:
                 if xfer.op == "WRITE":
                     self.store.objects[name] = ctypes.string_at(addr, size)
                     continue
-                data = self.store.objects.get(name)
+                data = xfer.snapshot or self.store.objects.get(name)
                 if data is None:
                     return False
                 # Silent short fill, as the OBJ plugin does.
                 ctypes.memmove(addr, data, min(size, len(data)))
             else:
-                offset, fd = row[0], row[2]
-                if xfer.op == "WRITE":
-                    os.pwrite(fd, ctypes.string_at(addr, size), offset)
-                    continue
-                data = os.pread(fd, size, offset)
+                offset = row[0]
+                # Reopen so O_DIRECT alignment rules do not apply to the fake.
+                plain = os.open(f"/proc/self/fd/{row[2]}", os.O_RDWR)
+                try:
+                    if xfer.op == "WRITE":
+                        os.pwrite(plain, ctypes.string_at(addr, size), offset)
+                        continue
+                    data = os.pread(plain, size, offset)
+                finally:
+                    os.close(plain)
                 if len(data) < size:
                     return False
                 ctypes.memmove(addr, data, size)
@@ -449,6 +478,9 @@ class FakeNixlEnv:
     """
 
     def __init__(self, monkeypatch) -> None:
+        self.monkeypatch = monkeypatch
+        self.gates: list[threading.Event] = []
+        self.test_thread = threading.get_ident()
         self.agents: list[FakeG4Agent] = []
         self._main: FakeMainAgent | None = None
         self._storage: FakeG4Agent | None = None
@@ -483,6 +515,8 @@ class FakeNixlEnv:
             self.agents.append(storage)
 
     def release_all(self) -> None:
+        for gate in self.gates:
+            gate.set()
         for agent in self.agents:
             agent.open_gates()
 
@@ -627,6 +661,76 @@ class World:
     def advance(self, seconds: float) -> None:
         self.now[0] = seconds
 
+    def install_stat_spy(self) -> None:
+        """File flavor: record, gate and fail the existence checks (stat calls)."""
+        self.stat_gate = None
+        self.stat_blocked = 0
+        self.stat_log: list[str] = []
+        self.stat_error = False
+        real = os.stat
+        root = str(self.root)
+
+        def spy(path, *args, **kwargs):
+            text = os.fspath(path) if isinstance(path, str | os.PathLike) else ""
+            name = os.path.basename(text)
+            mine = threading.get_ident() != self.env.test_thread
+            if mine and text.startswith(root) and len(name) == 64:
+                self.stat_log.append(name)
+                gate = self.stat_gate
+                if gate is not None and not gate.is_set():
+                    self.stat_blocked += 1
+                    gate.wait(10)
+                    self.stat_blocked -= 1
+                if self.stat_error:
+                    raise OSError(errno.EIO, "check failed")
+            return real(path, *args, **kwargs)
+
+        self.env.monkeypatch.setattr(os, "stat", spy)
+
+    def hold_checks(self) -> threading.Event:
+        """Block every existence check until the returned event is set."""
+        gate = threading.Event()
+        self.env.gates.append(gate)
+        if self.flavor == "object":
+            self.storage.query_gate = gate
+        else:
+            self.stat_gate = gate
+        return gate
+
+    def blocked_checks(self) -> int:
+        return (
+            self.storage.query_blocked if self.flavor == "object" else self.stat_blocked
+        )
+
+    def check_names(self) -> list[str]:
+        """Digests of the keys checked so far, in call order."""
+        if self.flavor == "file":
+            return list(self.stat_log)
+        return [n.split("/")[-1] for call in self.storage.query_calls for n in call]
+
+    def check_calls(self) -> int:
+        """Storage calls made for checks (a batch is one call on OBJ)."""
+        if self.flavor == "object":
+            return len(self.storage.query_calls)
+        return len(self.stat_log)
+
+    def fail_checks(self) -> None:
+        if self.flavor == "object":
+            self.storage.query_error = RuntimeError("endpoint down")
+        else:
+            self.stat_error = True
+
+    def query_only(self, key: BlockKey, rid: str = "r"):
+        """Wait for a check result using query alone, never poll_completed."""
+        deadline = time.monotonic() + WAIT_SECONDS
+        while True:
+            status = self.kvcr.query([key], rid)[0]
+            if status[0] is not QueryStatus.FETCHING:
+                return status
+            if time.monotonic() > deadline:
+                raise AssertionError("check result never reached query")
+            time.sleep(0.001)
+
     @property
     def local_dram(self):
         return self.kvcr._core._local_dram
@@ -692,6 +796,7 @@ def new_world(
 ) -> World:
     """Single-pool world: one block is `pages` pages, `slots` G2 slots."""
     world = World()
+    world.env = env
     world.flavor = flavor
     block = pages * PAGE
     world.piece = block
@@ -702,9 +807,9 @@ def new_world(
         world.root = tmp_path / "g4root"
     if world.root is not None and not world.root.exists():
         world.root.mkdir()
-    world.engine = ctypes.create_string_buffer(8 * block)
+    world.engine = aligned(8 * block)
     world.engine_view = memoryview(world.engine).cast("B")
-    world.local = ctypes.create_string_buffer(slots * block)
+    world.local = aligned(slots * block)
     world.main = FakeMainAgent()
     world.storage = FakeG4Agent(world.store)
     world.policy = _MoveToG4Policy() if policy == "move" else policy
@@ -730,6 +835,8 @@ def new_world(
         g3=g3,
     )
     world.kvcr._core._clock = lambda: world.now[0]
+    if flavor == "file" and world.root is not None:
+        world.install_stat_spy()
     return world
 
 
@@ -747,6 +854,7 @@ def new_hybrid_world(
     Block i uses framework element i of `full` and elements 2i, 2i+1 of `swa`.
     """
     world = World()
+    world.env = env
     world.flavor = flavor
     world.piece = PAGE
     world.prefix = PREFIX
@@ -808,6 +916,8 @@ def new_hybrid_world(
     )
     world.kvcr._core._clock = lambda: world.now[0]
     world.layout = tuple(key_layout)
+    if flavor == "file":
+        world.install_stat_spy()
     return world
 
 

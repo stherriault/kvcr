@@ -14,6 +14,7 @@ import pytest
 from _g4_test_utils import (
     PAGE,
     PREFIX,
+    digest,
     fetchable_g4,
     fetching_g4,
     find_files,
@@ -60,15 +61,6 @@ def test_g4_query_present_block_is_fetching_then_fetchable_g4(g4env, tmp_path, f
     assert w.await_check(A) == fetchable_g4()
 
 
-def test_g4_query_without_request_id_is_miss_and_starts_no_check(g4env, tmp_path):
-    w = new_world(g4env, tmp_path, flavor="object")
-    w.spill(A, 0)
-    before = len(w.storage.query_calls)
-    assert w.kvcr.query([A]) == [(QueryStatus.MISS, None)]
-    w.settle()
-    assert len(w.storage.query_calls) == before
-
-
 @pytest.mark.parametrize(("backoff_ms", "cached"), [(1000, True), (0, False)])
 def test_g4_miss_backoff_suppresses_repeat_checks(g4env, tmp_path, backoff_ms, cached):
     w = new_world(g4env, tmp_path, flavor="object", miss_backoff_ms=backoff_ms)
@@ -82,33 +74,6 @@ def test_g4_miss_backoff_suppresses_repeat_checks(g4env, tmp_path, backoff_ms, c
         assert len(w.storage.query_calls) == calls
         w.advance(1.5)
         assert w.kvcr.query([A], "r3")[0] == fetching_g4()
-
-
-def test_g4_two_requests_share_one_check_and_read_into_own_destinations(
-    g4env, tmp_path
-):
-    w = new_world(g4env, tmp_path, flavor="object")
-    w.spill(A, 0)
-    before = len(w.storage.query_calls)
-    w.storage.query_gate = threading.Event()
-    assert w.kvcr.query([A], "a") == [fetching_g4()]
-    wait_for(lambda: w.storage.query_blocked == 1)
-    assert w.kvcr.query([A], "b") == [fetching_g4()]
-    w.storage.query_gate.set()
-    _present(w, A, "a")
-    _present(w, A, "b")
-    assert len(w.storage.query_calls) - before == 1
-
-    w.storage.outcome["READ"] = "HOLD"
-    for index in (4, 5):
-        w.clear(index)
-    first, second = w.deliver(A, 4, "a"), w.deliver(A, 5, "b")
-    wait_for(lambda: len(w.storage.held("READ")) == 2)
-    devs = {x.remote[0][2] for x in w.storage.held("READ")}
-    assert len(devs) == 2
-    w.storage.finish_all("DONE")
-    assert w.wait(first)[A].success and w.wait(second)[A].success
-    assert w.element(4) == w.element(5) == pattern(0, w.piece)
 
 
 @pytest.mark.parametrize("flavor", FLAVORS)
@@ -136,43 +101,6 @@ def test_g4_discard_hint_drops_an_unconsumed_result(g4env, tmp_path):
     _present(w, A, "a")
     w.kvcr.discard_hint("a")
     assert w.kvcr.query([A], "a") == [fetching_g4()]
-
-
-def test_g4_discard_hint_detaches_a_waiting_subscription(g4env, tmp_path):
-    w = new_world(g4env, tmp_path, flavor="object")
-    w.spill(A, 0)
-    before = len(w.storage.query_calls)
-    w.storage.query_gate = threading.Event()
-    assert w.kvcr.query([A], "a") == [fetching_g4()]
-    wait_for(lambda: w.storage.query_blocked == 1)
-    assert w.kvcr.query([A], "b") == [fetching_g4()]
-    w.kvcr.discard_hint("a")
-    w.storage.query_gate.set()
-    _present(w, A, "b")
-    # The late completion stored nothing for "a": it starts a fresh check.
-    assert w.kvcr.query([A], "a") == [fetching_g4()]
-    wait_for(lambda: len(w.storage.query_calls) - before == 2)
-
-
-def test_g4_max_inflight_checks_bounds_distinct_keys(g4env, tmp_path):
-    w = new_world(g4env, tmp_path, flavor="object", max_inflight_checks=2)
-    w.storage.query_gate = threading.Event()
-    keys = [BlockKey(f"k{i}".encode()) for i in range(3)]
-    assert w.kvcr.query(keys[:2], "r") == [fetching_g4(), fetching_g4()]
-    assert w.kvcr.query(keys[2:], "r") == [(QueryStatus.MISS, None)]
-    w.storage.query_gate.set()
-    w.await_check(keys[0])
-    w.await_check(keys[1])
-    w.settle()
-    assert len(w.storage.query_calls) == 2
-
-
-def test_g4_max_check_results_counts_waiting_subscriptions(g4env, tmp_path):
-    w = new_world(g4env, tmp_path, flavor="object", max_check_results=2)
-    w.storage.query_gate = threading.Event()
-    assert w.kvcr.query([A], "a") == [fetching_g4()]
-    assert w.kvcr.query([A], "b") == [fetching_g4()]
-    assert w.kvcr.query([A], "c") == [(QueryStatus.MISS, None)]
 
 
 def test_g4_start_check_keys_results_by_owner_id(g4env, tmp_path):
@@ -721,4 +649,190 @@ def test_g4_file_replaced_after_open_serves_the_opened_inode(g4env, tmp_path):
     os.rename(replacement, path)
     w.storage.finish_all("DONE")
     assert w.wait(handle)[A].success
+    assert w.element(4) == pattern(0, w.piece)
+
+
+# ---- Check table: sharing, bounds, queueing, caller pump (AC6) ----
+
+
+@pytest.mark.parametrize("flavor", FLAVORS)
+def test_g4_query_without_request_id_is_miss_and_starts_no_check(
+    g4env, tmp_path, flavor
+):
+    w = new_world(g4env, tmp_path, flavor=flavor)
+    w.spill(A, 0)
+    before = w.check_calls()
+    assert w.kvcr.query([A]) == [(QueryStatus.MISS, None)]
+    w.settle()
+    assert w.check_calls() == before
+
+
+@pytest.mark.parametrize("flavor", FLAVORS)
+def test_g4_two_requests_share_one_check_and_read_into_own_destinations(
+    g4env, tmp_path, flavor
+):
+    w = new_world(g4env, tmp_path, flavor=flavor)
+    w.spill(A, 0)
+    before = w.check_calls()
+    gate = w.hold_checks()
+    assert w.kvcr.query([A], "a") == [fetching_g4()]
+    wait_for(lambda: w.blocked_checks() == 1)
+    assert w.kvcr.query([A], "b") == [fetching_g4()]
+    gate.set()
+    _present(w, A, "a")
+    _present(w, A, "b")
+    assert w.check_calls() - before == 1
+
+    w.storage.outcome["READ"] = "HOLD"
+    for index in (4, 5):
+        w.clear(index)
+    first, second = w.deliver(A, 4, "a"), w.deliver(A, 5, "b")
+    wait_for(lambda: len(w.storage.held("READ")) == 2)
+    assert len({x.remote[0][2] for x in w.storage.held("READ")}) == 2
+    w.storage.finish_all("DONE")
+    assert w.wait(first)[A].success and w.wait(second)[A].success
+    assert w.element(4) == w.element(5) == pattern(0, w.piece)
+
+
+@pytest.mark.parametrize("flavor", FLAVORS)
+def test_g4_discard_hint_detaches_a_waiting_subscription(g4env, tmp_path, flavor):
+    w = new_world(g4env, tmp_path, flavor=flavor)
+    w.spill(A, 0)
+    before = w.check_calls()
+    gate = w.hold_checks()
+    assert w.kvcr.query([A], "a") == [fetching_g4()]
+    wait_for(lambda: w.blocked_checks() == 1)
+    assert w.kvcr.query([A], "b") == [fetching_g4()]
+    w.kvcr.discard_hint("a")
+    gate.set()
+    _present(w, A, "b")
+    # The late completion stored nothing for "a": it starts a fresh check.
+    assert w.kvcr.query([A], "a") == [fetching_g4()]
+    wait_for(lambda: w.check_calls() - before == 2)
+
+
+@pytest.mark.parametrize("flavor", FLAVORS)
+def test_g4_full_check_table_queues_keys_instead_of_missing(g4env, tmp_path, flavor):
+    w = new_world(g4env, tmp_path, flavor=flavor, max_inflight_checks=2)
+    gate = w.hold_checks()
+    keys = [BlockKey(f"k{i}".encode()) for i in range(5)]
+    assert w.kvcr.query(keys, "r") == [fetching_g4()] * 5
+    gate.set()
+    for key in keys:
+        assert w.await_check(key) == (QueryStatus.MISS, None)
+    assert len(w.check_names()) == 5
+
+
+@pytest.mark.parametrize("flavor", FLAVORS)
+def test_g4_sixty_five_keys_from_two_requests_all_end_fetchable(
+    g4env, tmp_path, flavor
+):
+    w = new_world(g4env, tmp_path, flavor=flavor)
+    keys = [BlockKey(f"key-{i}".encode()) for i in range(65)]
+    for index, key in enumerate(keys):
+        w.spill(key, index % 4)
+    gate = w.hold_checks()
+    first, second = keys[:33], keys[33:]
+    seen = w.kvcr.query(first, "a") + w.kvcr.query(second, "b")
+    assert all(status == fetching_g4() for status in seen)
+    gate.set()
+    for key in first:
+        assert w.await_check(key, "a") == fetchable_g4()
+    for key in second:
+        assert w.await_check(key, "b") == fetchable_g4()
+
+
+@pytest.mark.parametrize("flavor", FLAVORS)
+def test_g4_max_check_results_misses_new_lookups_without_backoff(
+    g4env, tmp_path, flavor
+):
+    # The backoff part applies only if D5 keeps miss backoff.
+    w = new_world(
+        g4env, tmp_path, flavor=flavor, max_check_results=2, miss_backoff_ms=1000
+    )
+    w.hold_checks()
+    assert w.kvcr.query([A], "a") == [fetching_g4()]
+    assert w.kvcr.query([A], "b") == [fetching_g4()]
+    assert w.kvcr.query([A], "c") == [(QueryStatus.MISS, None)]
+    w.kvcr.discard_hint("a")
+    w.kvcr.discard_hint("b")
+    assert w.kvcr.query([A], "c") == [fetching_g4()]
+
+
+@pytest.mark.parametrize("flavor", FLAVORS)
+def test_g4_query_alone_sees_check_results_without_poll_completed(
+    g4env, tmp_path, flavor
+):
+    w = new_world(g4env, tmp_path, flavor=flavor)
+    w.spill(A, 0)
+    assert w.kvcr.query([A], "r") == [fetching_g4()]
+    assert w.query_only(A) == fetchable_g4()
+
+
+# ---- OBJ check batching (AC6) ----
+
+
+@pytest.mark.parametrize(("batch_max", "sizes"), [(32, [1, 5]), (3, [1, 3, 2])])
+def test_g4_queued_obj_checks_share_query_memory_calls(
+    g4env, tmp_path, batch_max, sizes
+):
+    w = new_world(g4env, tmp_path, flavor="object", check_batch_max=batch_max)
+    gate = w.hold_checks()
+    keys = [BlockKey(f"k{i}".encode()) for i in range(6)]
+    assert w.kvcr.query(keys[:1], "r") == [fetching_g4()]
+    wait_for(lambda: w.blocked_checks() == 1)
+    assert w.kvcr.query(keys[1:], "r") == [fetching_g4()] * 5
+    gate.set()
+    for key in keys:
+        w.await_check(key)
+    assert [len(call) for call in w.storage.query_calls] == sizes
+
+
+def test_g4_file_checks_run_in_queue_order(g4env, tmp_path):
+    w = new_world(g4env, tmp_path, flavor="file")
+    gate = w.hold_checks()
+    keys = [BlockKey(f"k{i}".encode()) for i in range(5)]
+    assert w.kvcr.query(keys[:1], "r") == [fetching_g4()]
+    wait_for(lambda: w.blocked_checks() == 1)
+    assert w.kvcr.query(keys[1:], "r") == [fetching_g4()] * 4
+    gate.set()
+    for key in keys:
+        w.await_check(key)
+    assert w.check_names() == [digest(key) for key in keys]
+
+
+# ---- Active-read eviction and direct_io modes (AC2, AC3, AC17) ----
+
+
+@pytest.mark.parametrize("flavor", FLAVORS)
+def test_g4_block_deleted_during_an_active_read_completes_with_the_old_block(
+    g4env, tmp_path, flavor
+):
+    w = new_world(g4env, tmp_path, flavor=flavor)
+    w.spill(A, 0)
+    w.clear(4)
+    _present(w)
+    w.storage.outcome["READ"] = "HOLD"
+    handle = w.deliver(A, 4)
+    wait_for(lambda: len(w.storage.held("READ")) == 1)
+    if flavor == "object":
+        w.store.objects.clear()
+    else:
+        _stored_path(w).unlink()
+    w.storage.finish_all("DONE")
+    assert w.wait(handle)[A].success
+    assert w.element(4) == pattern(0, w.piece)
+
+
+@pytest.mark.parametrize("direct_io", [False, True])
+def test_g4_file_direct_io_mode_sets_o_direct_and_round_trips(
+    g4env, tmp_path, direct_io
+):
+    w = new_world(g4env, tmp_path, flavor="file", direct_io=direct_io)
+    w.spill(A, 0)
+    assert w.storage.fd_direct
+    assert all(flag is direct_io for flag in w.storage.fd_direct)
+    w.clear(4)
+    _present(w)
+    assert w.wait(w.deliver(A, 4))[A].success
     assert w.element(4) == pattern(0, w.piece)

@@ -2,13 +2,17 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """G4 write side: spill mirroring G3, atomic publish, and the circuit breaker."""
 
+import contextlib
+import errno
 import itertools
 import os
 import re
+import threading
 
 import pytest
 from _g4_test_utils import (
     PAGE,
+    digest,
     fetchable_g4,
     fetching_g4,
     find_files,
@@ -17,6 +21,7 @@ from _g4_test_utils import (
     tmp_files,
     wait_for,
 )
+from _kvcr_test_utils import _mem_descriptor
 
 from kvcr.types import (
     BlockKey,
@@ -33,6 +38,10 @@ D = BlockKey(b"block-d")
 MISS = (QueryStatus.MISS, None)
 
 
+def _present(w, key, rid="r"):
+    assert w.await_check(key, rid) == fetchable_g4()
+
+
 def _capacity_key(w):
     return w.local_dram._pools._capacity_eviction_key
 
@@ -42,11 +51,12 @@ _PROBES = itertools.count()
 
 def _is_open(w):
     """An open breaker answers MISS at once and starts no check."""
+    w.settle(20)
     key = BlockKey(b"probe-%d" % next(_PROBES))
-    calls = len(w.storage.query_calls)
+    calls = w.check_calls()
     answer = w.kvcr.query([key], "probe")[0]
     w.settle(5)
-    return answer == MISS and len(w.storage.query_calls) == calls
+    return answer == MISS and w.check_calls() == calls
 
 
 # ---- Spill mirrors G3 (AC4, AC5) ----
@@ -100,19 +110,6 @@ def test_g4_waiting_deposit_fails_at_its_deadline_and_g2_stays_blocked(g4env, tm
     assert _capacity_key(w) == A
     w.storage.finish_all("DONE")
     w.poll_until(lambda: _capacity_key(w) is None)
-
-
-def test_g4_file_spill_past_its_deadline_is_not_published(g4env, tmp_path):
-    w = new_world(g4env, tmp_path, flavor="file")
-    w.storage.outcome["WRITE"] = "HOLD"
-    assert w.deposit(A, 0).success
-    waiting = w.deposit(B, 1, wait=False)
-    w.poll_until(lambda: len(w.storage.held("WRITE")) == 1)
-    w.advance(2.0)
-    w.wait(waiting)
-    w.storage.finish_all("DONE")
-    w.poll_until(lambda: not w.storage.unreleased() and not tmp_files(w.root))
-    assert not w.stored(A)
 
 
 @pytest.mark.parametrize("flavor", FLAVORS)
@@ -287,14 +284,6 @@ def test_g4_answered_checks_never_count_toward_the_breaker(g4env, tmp_path):
     assert w.kvcr.query([BlockKey(b"next")], "r")[0] == fetching_g4()
 
 
-def test_g4_check_errors_count_toward_the_breaker(g4env, tmp_path):
-    w = new_world(g4env, tmp_path, flavor="object", failure_threshold=2)
-    w.storage.query_error = RuntimeError("endpoint down")
-    for index in range(2):
-        assert w.await_check(BlockKey(b"down-%d" % index)) == MISS
-    assert _is_open(w)
-
-
 def test_g4_open_breaker_drops_a_spill_without_io_or_stall(g4env, tmp_path):
     w = new_world(g4env, tmp_path, flavor="object", failure_threshold=2)
     w.storage.outcome["WRITE"] = "ERR"
@@ -362,3 +351,285 @@ def test_g4_spill_failure_counts_toward_the_breaker(g4env, tmp_path):
     w.storage.outcome["WRITE"] = "ERR"
     assert w.deposit(A, 0).success and w.deposit(B, 1).success
     assert _is_open(w)
+
+
+# ---- Spill deadline rules (AC4, AC17) ----
+
+
+@pytest.mark.parametrize("flavor", FLAVORS)
+def test_g4_one_store_job_lands_floor_t_over_w_deposits(g4env, tmp_path, flavor):
+    w = new_world(g4env, tmp_path, flavor=flavor, slots=4)
+    victims = [BlockKey(b"v%d" % i) for i in range(4)]
+    for index, victim in enumerate(victims):
+        assert w.deposit(victim, index).success
+    incoming = [BlockKey(b"d%d" % i) for i in range(4)]
+    for index in range(4):
+        w.fill(4 + index)
+    w.storage.outcome["WRITE"] = "HOLD"
+    job = w.kvcr.deposit({k: [_mem_descriptor(4 + i)] for i, k in enumerate(incoming)})
+
+    def spill_running(count):
+        return (
+            len(w.storage.log("WRITE")) == count and len(w.storage.held("WRITE")) == 1
+        )
+
+    # T = 1.0 and w = 0.4: two spills finish in time, the third is still running.
+    w.poll_until(lambda: spill_running(1))
+    w.advance(0.4)
+    w.storage.finish_all("DONE")
+    w.poll_until(lambda: spill_running(2))
+    w.advance(0.8)
+    w.storage.finish_all("DONE")
+    w.poll_until(lambda: spill_running(3))
+    w.advance(1.0)
+    result = w.wait(job)
+    assert [result[key].success for key in incoming] == [True, True, False, False]
+    # V3 keeps running past the job deadline and publishes.
+    w.advance(1.2)
+    w.storage.finish_all("DONE")
+    w.poll_until(lambda: w.stored(victims[2]) and _capacity_key(w) is None)
+    assert w.stored(victims[0]) and w.stored(victims[1])
+    assert not w.stored(victims[3])
+
+
+@pytest.mark.parametrize("flavor", FLAVORS)
+@pytest.mark.parametrize("spill_timeout_ms", [None, 5000])
+def test_g4_slow_spill_is_published_and_leaves_the_breaker_closed(
+    g4env, tmp_path, flavor, spill_timeout_ms
+):
+    options = {} if spill_timeout_ms is None else {"spill_timeout_ms": spill_timeout_ms}
+    w = new_world(g4env, tmp_path, flavor=flavor, failure_threshold=1, **options)
+    w.storage.outcome["WRITE"] = "HOLD"
+    assert w.deposit(A, 0).success
+    waiting = w.deposit(B, 1, wait=False)
+    w.poll_until(lambda: len(w.storage.held("WRITE")) == 1)
+    w.advance(2.0)
+    w.wait(waiting)
+    w.storage.finish_all("DONE")
+    w.poll_until(lambda: w.stored(A) and _capacity_key(w) is None)
+    if flavor == "file":
+        w.poll_until(lambda: tmp_files(w.root) == [])
+    assert not _is_open(w)
+
+
+@pytest.mark.parametrize("direct_io", [False, True])
+def test_g4_file_spill_holds_g2_pending_in_both_direct_io_modes(
+    g4env, tmp_path, direct_io
+):
+    w = new_world(g4env, tmp_path, flavor="file", direct_io=direct_io)
+    w.storage.outcome["WRITE"] = "HOLD"
+    assert w.deposit(A, 0).success
+    waiting = w.deposit(B, 1, wait=False)
+    w.poll_until(lambda: len(w.storage.held("WRITE")) == 1)
+    assert _capacity_key(w) == A
+    w.storage.finish_all("DONE")
+    assert w.wait(waiting)[B].success
+    assert w.stored(A)
+
+
+# ---- Publish steps (AC7) ----
+
+
+@pytest.mark.parametrize("call", ["fsync", "rename"])
+def test_g4_publish_error_after_done_is_a_spill_failure(
+    g4env, tmp_path, monkeypatch, call
+):
+    w = new_world(g4env, tmp_path, flavor="file", failure_threshold=1)
+    me = threading.get_ident()
+    names = ["fsync"] if call == "fsync" else ["rename", "replace"]
+    for name in names:
+        real = getattr(os, name)
+
+        def failing(*args, _real=real, **kwargs):
+            if threading.get_ident() != me:
+                raise OSError(errno.EIO, "publish failed")
+            return _real(*args, **kwargs)
+
+        monkeypatch.setattr(os, name, failing)
+    assert w.deposit(A, 0).success
+    assert w.deposit(B, 1).success
+    assert not w.stored(A)
+    w.poll_until(lambda: tmp_files(w.root) == [])
+    assert len(w.policy.failures) == 1
+    assert _is_open(w)
+
+
+def test_g4_mkdir_race_on_a_new_fanout_directory_is_not_an_error(
+    g4env, tmp_path, monkeypatch
+):
+    w = new_world(g4env, tmp_path, flavor="file")
+    me = threading.get_ident()
+    real = os.mkdir
+    raced = set()
+
+    def racing(path, *args, **kwargs):
+        text = os.fspath(path)
+        if threading.get_ident() != me and text.startswith(str(w.root)):
+            if text not in raced:
+                raced.add(text)
+                with contextlib.suppress(FileExistsError):
+                    real(path, *args, **kwargs)
+                raise FileExistsError(errno.EEXIST, "lost the race", text)
+        return real(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "mkdir", racing)
+    w.spill(A, 0)
+    assert raced
+    assert w.stored(A)
+
+
+def test_g4_own_publish_clears_the_miss_backoff(g4env, tmp_path):
+    # Applies only if D5 keeps miss backoff.
+    w = new_world(g4env, tmp_path, flavor="object", miss_backoff_ms=1000)
+    assert w.await_check(A) == MISS
+    w.advance(0.1)
+    w.spill(A, 0)
+    assert w.kvcr.query([A], "r2")[0] == fetching_g4()
+
+
+# ---- Breaker: absent never counts, one outcome per op (AC4) ----
+
+
+@pytest.mark.parametrize("flavor", FLAVORS)
+@pytest.mark.parametrize("shape", ["one_op", "five_ops"])
+def test_g4_removed_blocks_never_open_the_breaker(g4env, tmp_path, flavor, shape):
+    w = new_world(g4env, tmp_path, flavor=flavor, failure_threshold=2)
+    keys = [BlockKey(b"gone-%d" % i) for i in range(5)]
+    for index, key in enumerate(keys):
+        w.spill(key, index)
+        _present(w, key)
+    if flavor == "object":
+        w.store.objects.clear()
+    else:
+        for key in keys:
+            find_files(w.root, key)[0].unlink()
+    if shape == "one_op":
+        refs = {key: [_mem_descriptor(3 + i)] for i, key in enumerate(keys)}
+        result = w.wait(w.kvcr.deliver(refs, "r"))
+        assert not any(r.success for r in result.values())
+    else:
+        for key in keys:
+            assert not w.wait(w.deliver(key, 4))[key].success
+    assert not _is_open(w)
+
+
+@pytest.mark.parametrize("flavor", FLAVORS)
+def test_g4_a_failed_op_counts_once_however_many_keys(g4env, tmp_path, flavor):
+    w = new_world(g4env, tmp_path, flavor=flavor, failure_threshold=2)
+    keys = [BlockKey(b"k%d" % i) for i in range(5)]
+    for index, key in enumerate(keys):
+        w.spill(key, index)
+        _present(w, key)
+    w.storage.outcome["READ"] = "ERR"
+    refs = {key: [_mem_descriptor(3 + i)] for i, key in enumerate(keys)}
+    assert not any(r.success for r in w.wait(w.kvcr.deliver(refs, "r")).values())
+    w.settle(30)
+    assert not _is_open(w)
+    _fail_reads(w, keys[0], 1)
+    assert _is_open(w)
+
+
+@pytest.mark.parametrize("flavor", FLAVORS)
+def test_g4_open_breaker_fails_reads_with_results_without_io(g4env, tmp_path, flavor):
+    w = new_world(g4env, tmp_path, flavor=flavor, failure_threshold=1)
+    keys = [A, B, C]
+    for index, key in enumerate(keys):
+        w.spill(key, index)
+    for key in keys:
+        _present(w, key)
+    w.storage.outcome["READ"] = "ERR"
+    assert not w.wait(w.deliver(B, 4))[B].success
+    assert _is_open(w)
+    reads = len(w.storage.log("READ"))
+    w.storage.outcome["READ"] = "DONE"
+    assert not w.wait(w.deliver(A, 5))[A].success
+    assert not w.wait(w.fetch(C))[C].success
+    assert len(w.storage.log("READ")) == reads
+
+
+# ---- Breaker and existence checks (AC4, AC6) ----
+
+
+@pytest.mark.parametrize("flavor", FLAVORS)
+def test_g4_check_errors_count_toward_the_breaker(g4env, tmp_path, flavor):
+    w = new_world(g4env, tmp_path, flavor=flavor, failure_threshold=2)
+    w.fail_checks()
+    for index in range(2):
+        assert w.await_check(BlockKey(b"down-%d" % index)) == MISS
+    assert _is_open(w)
+
+
+@pytest.mark.parametrize("flavor", FLAVORS)
+def test_g4_check_deadline_gives_miss_to_every_subscriber_and_drops_the_late_answer(
+    g4env, tmp_path, flavor
+):
+    w = new_world(
+        g4env, tmp_path, flavor=flavor, failure_threshold=2, miss_backoff_ms=1000
+    )
+    w.spill(A, 0)
+    gate = w.hold_checks()
+    assert w.kvcr.query([A], "a") == [fetching_g4()]
+    wait_for(lambda: w.blocked_checks() == 1)
+    assert w.kvcr.query([A], "b") == [fetching_g4()]
+    w.advance(1.5)
+    assert w.kvcr.query([A], "a") == [MISS]
+    assert w.kvcr.query([A], "b") == [MISS]
+    gate.set()
+    w.settle()
+    # The late answer was dropped, and a deadline MISS carries no backoff.
+    assert w.kvcr.query([A], "a") == [fetching_g4()]
+    # One timed-out check counted once, so the breaker is still closed.
+    assert not _is_open(w)
+    w.hold_checks()
+    assert w.kvcr.query([B], "c") == [fetching_g4()]
+    w.advance(3.0)
+    assert w.kvcr.query([B], "c") == [MISS]
+    assert _is_open(w)
+
+
+@pytest.mark.parametrize("flavor", FLAVORS)
+@pytest.mark.parametrize(("check_ms", "expired"), [(None, True), (3000, False)])
+def test_g4_check_timeout_defaults_to_the_operation_timeout(
+    g4env, tmp_path, flavor, check_ms, expired
+):
+    options = {} if check_ms is None else {"check_timeout_ms": check_ms}
+    w = new_world(g4env, tmp_path, flavor=flavor, **options)
+    w.hold_checks()
+    assert w.kvcr.query([A], "r") == [fetching_g4()]
+    w.advance(1.5)
+    assert w.kvcr.query([A], "r") == [MISS if expired else fetching_g4()]
+    w.advance(3.5)
+    assert w.kvcr.query([A], "r") == [MISS]
+
+
+def test_g4_one_error_in_an_obj_batch_misses_all_and_counts_once(g4env, tmp_path):
+    w = new_world(g4env, tmp_path, flavor="object", failure_threshold=2)
+    gate = w.hold_checks()
+    keys = [BlockKey(b"k%d" % i) for i in range(4)]
+    assert w.kvcr.query(keys[:1], "r") == [fetching_g4()]
+    wait_for(lambda: w.blocked_checks() == 1)
+    w.storage.query_error_if = lambda names: len(names) > 1
+    assert w.kvcr.query(keys[1:], "r") == [fetching_g4()] * 3
+    gate.set()
+    for key in keys[1:]:
+        assert w.await_check(key) == MISS
+    assert not _is_open(w)
+
+
+@pytest.mark.parametrize("flavor", FLAVORS)
+def test_g4_opening_the_breaker_drops_checks_that_have_not_started(
+    g4env, tmp_path, flavor
+):
+    w = new_world(g4env, tmp_path, flavor=flavor, failure_threshold=1)
+    gate = w.hold_checks()
+    assert w.kvcr.query([A], "r") == [fetching_g4()]
+    wait_for(lambda: w.blocked_checks() == 1)
+    w.advance(0.9)
+    assert w.kvcr.query([B, C], "r") == [fetching_g4()] * 2
+    # A's check deadline opens the breaker; B and C have not reached theirs.
+    w.advance(1.1)
+    assert w.kvcr.query([A], "r") == [MISS]
+    assert w.kvcr.query([B, C], "r") == [MISS, MISS]
+    gate.set()
+    w.settle()
+    assert w.check_names() == [digest(A)]

@@ -35,10 +35,29 @@ def _open_fds_under(root):
 
 
 def _check_in_flight(w, mp):
-    w.storage.query_gate = threading.Event()
+    gate = w.hold_checks()
     assert w.kvcr.query([A], "r") == [fetching_g4()]
-    wait_for(lambda: w.storage.query_blocked == 1)
-    return w.storage.query_gate.set
+    wait_for(lambda: w.blocked_checks() == 1)
+    return gate.set
+
+
+def _check_queued(w, mp):
+    release = _check_in_flight(w, mp)
+    assert w.kvcr.query([B], "r") == [fetching_g4()]
+    return release
+
+
+def _pending_start(w, mp):
+    return _check_queued(w, mp)
+
+
+def _spill_queued_unstarted(w, mp):
+    assert w.deposit(A, 0).success
+    release = _check_in_flight(w, mp)
+    w.deposit(B, 1, wait=False)
+    w.settle(5)
+    assert w.storage.log("WRITE") == []
+    return release
 
 
 def _registered_not_submitted(w, mp):
@@ -112,22 +131,34 @@ def _fill_waiting(w, mp):
     return w.storage.finish_all
 
 
-STAGES = {
-    "check_in_flight": ("object", _check_in_flight),
-    "registered_not_submitted": ("object", _registered_not_submitted),
-    "read_in_flight": ("object", _read_in_flight),
-    "spill_in_flight": ("file", _spill_in_flight),
-    "read_error_released": ("object", _read_error_released),
-    "spill_done_released": ("object", _spill_done_released),
-    "file_worker_busy": ("file", _file_worker_busy),
-    "fill_waiting": ("object", _fill_waiting),
-}
+STAGES = [
+    ("check_in_flight", "object", {}, _check_in_flight),
+    ("check_in_flight", "file", {}, _check_in_flight),
+    ("check_queued", "object", {}, _check_queued),
+    ("check_queued", "file", {}, _check_queued),
+    ("pending_start", "object", {"max_inflight_checks": 1}, _pending_start),
+    ("pending_start", "file", {"max_inflight_checks": 1}, _pending_start),
+    ("spill_queued_unstarted", "object", {}, _spill_queued_unstarted),
+    ("registered_not_submitted", "object", {}, _registered_not_submitted),
+    ("read_in_flight", "object", {}, _read_in_flight),
+    ("spill_in_flight", "file", {}, _spill_in_flight),
+    ("read_error_released", "object", {}, _read_error_released),
+    ("spill_done_released", "object", {}, _spill_done_released),
+    ("file_worker_busy", "file", {}, _file_worker_busy),
+    ("fill_waiting", "object", {}, _fill_waiting),
+]
 
 
-@pytest.mark.parametrize("stage", STAGES)
-def test_g4_close_at_each_stage_leaves_no_leaks(g4env, tmp_path, monkeypatch, stage):
-    flavor, setup = STAGES[stage]
-    w = new_world(g4env, tmp_path, flavor=flavor)
+@pytest.mark.parametrize(
+    ("stage", "flavor", "options", "setup"),
+    STAGES,
+    ids=[f"{stage}-{flavor}" for stage, flavor, _, _ in STAGES],
+)
+def test_g4_close_at_each_stage_leaves_no_leaks(
+    g4env, tmp_path, monkeypatch, stage, flavor, options, setup
+):
+    threads = threading.active_count()
+    w = new_world(g4env, tmp_path, flavor=flavor, **options)
     release = setup(w, monkeypatch)
     timer = threading.Timer(0.2, release) if release is not None else None
     if timer is not None:
@@ -140,6 +171,12 @@ def test_g4_close_at_each_stage_leaves_no_leaks(g4env, tmp_path, monkeypatch, st
     assert w.kvcr._core.is_quiescent()
     assert w.storage.leaks() == []
     assert w.local_dram._pools._capacity_eviction_key is None
+    # Both G4 workers and the progress thread are joined.
+    assert threading.active_count() == threads
+    if stage in ("check_queued", "pending_start"):
+        assert len(w.check_names()) == 1
+    if stage == "spill_queued_unstarted":
+        assert w.storage.log("WRITE") == []
     if flavor == "file":
         assert tmp_files(w.root) == []
         assert _open_fds_under(w.root) == []

@@ -47,3 +47,23 @@ def g4env(monkeypatch):
     env = FakeNixlEnv(monkeypatch)
     yield env
     env.release_all()
+
+
+_DROP2_WORDS = ("obj", "object", "aws", "nixl_module", "head", "probe", "devid")
+
+
+def pytest_configure(config):
+    config.addinivalue_line("markers", "drop1: G4 file flavor delivery drop")
+    config.addinivalue_line("markers", "drop2: G4 OBJ flavor delivery drop")
+
+
+def pytest_collection_modifyitems(items):
+    """Tag G4 tests by delivery drop: file flavor is drop 1, OBJ is drop 2."""
+    for item in items:
+        if not item.fspath.basename.startswith("test_g4_"):
+            continue
+        flavor = getattr(getattr(item, "callspec", None), "params", {}).get("flavor")
+        if flavor is None:
+            name = item.originalname or item.name
+            flavor = "object" if any(w in name for w in _DROP2_WORDS) else "file"
+        item.add_marker(pytest.mark.drop2 if flavor == "object" else pytest.mark.drop1)

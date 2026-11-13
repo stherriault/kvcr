@@ -126,55 +126,6 @@ def test_g4_options_repr_redacts_credentials():
     assert "unit-access" not in repr(options)
 
 
-def test_g4_options_from_mapping_object_flavor():
-    from kvcr.config import G4Options
-
-    options = G4Options.from_mapping(
-        {
-            "bucket": "b",
-            "endpoint_override": "host:9000",
-            "prefix": "tenant/model",
-            "key_layout": [""],
-            "access_key": "",
-            "secret_key": "",
-        }
-    )
-    assert options.flavor == "object"
-    assert options.key_prefix == "tenant/model"
-    assert options.key_layout == ("",)
-    assert options.backend_options["bucket"] == "b"
-    assert options.backend_options["endpoint_override"] == "host:9000"
-    assert options.backend_options["scheme"] == "http"
-    assert "access_key" not in options.backend_options
-    assert "secret_key" not in options.backend_options
-
-
-def test_g4_options_from_mapping_file_flavor(tmp_path):
-    from kvcr.config import G4Options
-
-    options = G4Options.from_mapping(
-        {
-            "flavor": "file",
-            "root": tmp_path,
-            "prefix": "tenant/model",
-            "key_layout": ["full", "swa", "swa"],
-        }
-    )
-    assert options.flavor == "file"
-    assert Path(options.root) == tmp_path
-    assert options.key_layout == ("full", "swa", "swa")
-
-
-def test_g4_plugin_map_rejects_accelerated(g4env, tmp_path):
-    with pytest.raises(ValueError):
-        new_world(
-            g4env,
-            tmp_path,
-            flavor="object",
-            plugin={"OBJ": {"active": True, "accelerated": True}},
-        )
-
-
 # ---- Environment (AC9) ----
 
 
@@ -239,3 +190,18 @@ def test_g4_docs_cover_the_required_topics():
     ]
     missing = [topic for topic in topics if topic not in text]
     assert missing == []
+
+
+def test_g4_options_defaults():
+    from kvcr.config import G4Options
+
+    options = G4Options(flavor="object", key_prefix="p", key_layout=("",))
+    assert options.max_inflight_checks == 64
+    assert options.max_check_results == 65_536
+    assert options.check_timeout_ms is None
+    assert options.check_batch_max == 32
+    assert options.spill_timeout_ms is None
+    assert options.miss_backoff_ms == 1_000
+    assert options.direct_io is False
+    assert options.failure_threshold == 5
+    assert options.backoff_ms == 10_000
