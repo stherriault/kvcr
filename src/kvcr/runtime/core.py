@@ -997,6 +997,8 @@ class _KVCRCore:
                 resources.update(self._local_dram._pools.telemetry_state())
             if self._g3 is not None:
                 resources.update(self._g3.telemetry_state())
+            if self._g4 is not None:
+                resources.update(self._g4.telemetry_state())
         for resource, value in resources.items():
             stats.set_gauge(STATE_METRIC, value, (resource,))
         self._stats = self._stats_factory() if self._stats_factory else None
