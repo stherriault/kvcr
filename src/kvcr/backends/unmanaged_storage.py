@@ -21,16 +21,31 @@ import hashlib
 import logging
 import queue
 import threading
-from collections import deque
+import time
+from collections import OrderedDict, deque
+from collections.abc import Collection, Mapping
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from ..config import G4Options
 from ..runtime import progress as _progress
 from ..runtime.nixl_module import load_nixl, nixl_module_name
+from ..runtime.progress import (
+    _FAILED_RESULT,
+    _SUCCESS_RESULT,
+    _Op,
+    _OpId,
+    _TransferRef,
+)
 from ..types import (
     BlockKey,
+    CacheTier,
+    OpEntryResult,
+    OpHandle,
+    QueryStatus,
 )
+from .local_dram_pools import _layout_indices
 
 if TYPE_CHECKING:
     from ..runtime.core import _KVCRCore
@@ -41,6 +56,60 @@ _FORMAT_VERSION = 1
 _IDLE_WAIT_SECONDS = 0.0005
 _WAKE_SECONDS = 0.05
 _STOP = object()
+_FETCHING = (QueryStatus.FETCHING, CacheTier.G4)
+_FETCHABLE = (QueryStatus.FETCHABLE, CacheTier.G4)
+_MISS = (QueryStatus.MISS, None)
+
+
+@dataclass(eq=False)
+class _CheckJob:
+    """One existence check (or a post-ERR probe) for the workers."""
+
+    key: BlockKey
+    name: str
+    started: bool = False
+    cancelled: bool = False
+    result: Literal["", "present", "absent", "error"] = ""
+
+
+@dataclass(eq=False)
+class _Check:
+    job: _CheckJob | None
+    subscribers: set[str] = field(default_factory=set)
+    deadline: float = 0.0
+
+
+@dataclass(eq=False)
+class _Xfer:
+    """One key's transfer; fields are written by whichever stage owns it."""
+
+    op: "_G4Op"
+    key: BlockKey
+    name: str
+    local: list[tuple[int, int, int]]
+    remote: list[tuple[int, int]]
+    refs: list[_TransferRef]
+    fd: int | None = None
+    reg: Any = None
+    handle: Any = None
+    start_failed: bool = False
+    outcome: Literal["", "DONE", "ERR", "ABSENT", "PUBLISH_ERR"] = ""
+    finished: bool = False
+
+
+@dataclass(eq=False)
+class _G4Op(_Op):
+    kind: Literal["fill", "deliver", "spill"] = "deliver"
+    handle: OpHandle | None = None
+    deadline: float = 0.0
+    xfers: list[_Xfer] = field(default_factory=list)
+    results: dict[BlockKey, OpEntryResult] = field(default_factory=dict)
+    ended: bool = False
+    latched: bool = False
+
+    @property
+    def open_xfers(self) -> bool:
+        return any(not xfer.finished for xfer in self.xfers)
 
 
 class _StorageWorker:
@@ -54,6 +123,7 @@ class _StorageWorker:
         self.ready = threading.Event()
         self.error: BaseException | None = None
         self.failure: BaseException | None = None
+        self.unreleased: set[_Xfer] = set()
         self.agent: Any = None
         self.agent_name = f"{g4._kvcr.nixl_agent_name}-g4"
         self._dram_regs: list[Any] = []
@@ -120,27 +190,121 @@ class _StorageWorker:
             self.ready.set()
             return
         self.ready.set()
+        active: list[_Xfer] = []
+        close_deadline: float | None = None
         try:
             while True:
                 with self.cond:
-                    if not (self.jobs or self.stopping):
+                    if not (self.jobs or active or self.stopping):
                         self.cond.wait(_WAKE_SECONDS)
+                    jobs = list(self.jobs)
                     self.jobs.clear()
-                    if self.stopping:
+                    stopping = self.stopping
+                if stopping:
+                    # Close drops every job that has not started.
+                    jobs = []
+                    if close_deadline is None:
+                        close_deadline = (
+                            time.monotonic() + _progress._OP_CLEANUP_TIMEOUT_SECONDS
+                        )
+                for job in jobs:
+                    self._start(job, active)
+                worked = self._poll(active)
+                if stopping:
+                    if not active:
                         break
+                    if time.monotonic() >= close_deadline:
+                        raise RuntimeError("G4 storage transfers did not finish")
+                    time.sleep(_IDLE_WAIT_SECONDS)
+                    continue
+                if active and not worked:
+                    time.sleep(_IDLE_WAIT_SECONDS)
         except BaseException as error:
             self.failure = error
-        try:
-            self._deregister_dram()
-        except BaseException as error:
-            if self.failure is None:
-                self.failure = error
+        if not self.unreleased:
+            try:
+                self._deregister_dram()
+            except BaseException as error:
+                if self.failure is None:
+                    self.failure = error
 
     def _deregister_dram(self) -> None:
         agent = self.agent
         regs, self._dram_regs = self._dram_regs, []
         for reg in reversed(regs):
             agent.deregister_memory(reg, backends=[self._g4._backend])
+
+    def _start(self, xfer: _Xfer, active: list[_Xfer]) -> None:
+        g4 = self._g4
+        agent = self.agent
+        backend = g4._backend
+        try:
+            dev = xfer.fd
+            kind = "FILE"
+            reg_rows = [(0, g4._payload_len, dev, "")]
+            xfer.reg = agent.register_memory(
+                reg_rows, mem_type=kind, backends=[backend]
+            )
+            local = agent.get_xfer_descs(xfer.local, mem_type="DRAM")
+            remote = agent.get_xfer_descs(
+                [(offset, size, dev) for offset, size in xfer.remote], mem_type=kind
+            )
+            xfer.handle = agent.initialize_xfer(
+                "WRITE" if xfer.op.kind == "spill" else "READ",
+                local,
+                remote,
+                self.agent_name,
+                backends=[backend],
+            )
+            if xfer.handle is None:
+                raise RuntimeError("NIXL transfer creation returned None")
+        except Exception:
+            logger.warning("KVCR G4 transfer could not start", exc_info=True)
+            self._deregister(xfer)
+            xfer.start_failed = True
+            xfer.outcome = "ERR"
+            g4._after_storage(xfer)
+            return
+        self.unreleased.add(xfer)
+        active.append(xfer)
+        try:
+            agent.transfer(xfer.handle)
+        except Exception:
+            # The handle's own state decides; it is released only when terminal.
+            logger.warning("KVCR G4 transfer post was ambiguous", exc_info=True)
+
+    def _deregister(self, xfer: _Xfer) -> None:
+        reg, xfer.reg = xfer.reg, None
+        if reg is None:
+            return
+        try:
+            self.agent.deregister_memory(reg, backends=[self._g4._backend])
+        except Exception:
+            logger.warning("KVCR G4 deregistration failed", exc_info=True)
+
+    def _poll(self, active: list[_Xfer]) -> bool:
+        worked = False
+        agent = self.agent
+        for xfer in tuple(active):
+            try:
+                state = agent.check_xfer_state(xfer.handle)
+            except Exception:
+                logger.warning("KVCR G4 transfer state failed", exc_info=True)
+                state = "ERR"
+            if state in ("PROC", "PEND"):
+                continue
+            try:
+                agent.release_xfer_handle(xfer.handle)
+            except Exception:
+                logger.warning("KVCR G4 handle release failed", exc_info=True)
+                continue
+            active.remove(xfer)
+            self.unreleased.discard(xfer)
+            self._deregister(xfer)
+            xfer.outcome = "DONE" if state == "DONE" else "ERR"
+            self._g4._after_storage(xfer)
+            worked = True
+        return worked
 
 
 class _FileWorker:
@@ -172,6 +336,7 @@ class _G4:
     def __init__(self, kvcr: "_KVCRCore", options: G4Options) -> None:
         self._kvcr = kvcr
         self._options = options
+        config = kvcr.config
         if kvcr._local_dram is None:
             raise ValueError("G4 requires configured local DRAM")
         if options.flavor not in ("object", "file"):
@@ -198,6 +363,16 @@ class _G4:
             + [f"{label}={size}" for label, size in zip(layout, self._sizes)]
         )
         self._layout_tag = hashlib.sha256(schema.encode()).hexdigest()[:8]
+        for name in (
+            "max_inflight_checks",
+            "max_check_results",
+        ):
+            if type(getattr(options, name)) is not int or getattr(options, name) < 1:
+                raise ValueError(f"G4 {name} must be a positive integer")
+        for name in ("check_timeout_ms", "spill_timeout_ms"):
+            value = getattr(options, name)
+            if value is not None and (type(value) is not int or value <= 0):
+                raise ValueError(f"G4 {name} must be a positive integer or None")
         if not all(
             isinstance(key, str) and isinstance(value, str)
             for key, value in options.backend_options.items()
@@ -215,6 +390,20 @@ class _G4:
             self._backend = options.backend or "POSIX"
             self._root = Path(options.root)
         self._backend_params = params
+        self._check_timeout = (
+            options.check_timeout_ms or config.operation_timeout_ms
+        ) / 1000
+        self._job_lock = threading.Lock()
+        self._check_done: queue.SimpleQueue[_CheckJob] = queue.SimpleQueue()
+        self._op_done: queue.SimpleQueue[_Xfer] = queue.SimpleQueue()
+        self._checks: dict[BlockKey, _Check] = {}
+        self._pending_start: deque[BlockKey] = deque()
+        self._pending_count = 0
+        self._inflight = 0
+        self._sub_count = 0
+        self._results: OrderedDict[tuple[str, BlockKey], bool] = OrderedDict()
+        self._owner_keys: dict[str, set[BlockKey]] = {}
+        self._ops: dict[_OpId, _G4Op] = {}
         self._closing = False
         self._storage = _StorageWorker(self)
         self._file = _FileWorker(self)
@@ -242,6 +431,271 @@ class _G4:
         if self._storage.error is not None:
             raise self._storage.error
 
+    # Worker hand-offs.
+
+    def _try_start(self, job: _CheckJob) -> bool:
+        with self._job_lock:
+            if job.cancelled:
+                return False
+            job.started = True
+            return True
+
+    def _try_cancel(self, job: _CheckJob) -> bool:
+        with self._job_lock:
+            if job.started:
+                return False
+            job.cancelled = True
+            return True
+
+    def _after_storage(self, xfer: _Xfer) -> None:
+        if self._flavor == "file":
+            self._file.queue.put(xfer)
+        else:
+            self._op_done.put(xfer)
+
+    def _launch(self, xfer: _Xfer) -> None:
+        if self._flavor == "file":
+            self._file.queue.put(xfer)
+        else:
+            self._storage.submit(xfer)
+
+    # Existence checks.
+
+    def refresh(self) -> None:
+        """Apply finished checks and check deadlines; start queued checks."""
+        while True:
+            try:
+                job = self._check_done.get_nowait()
+            except queue.Empty:
+                break
+            self._apply_check(job)
+        now = self._kvcr._clock()
+        for key, check in tuple(self._checks.items()):
+            if (
+                self._checks.get(key) is check
+                and check.job is not None
+                and now >= check.deadline
+            ):
+                self._resolve_check(key, check, False)
+        self._start_pending(now)
+
+    def _apply_check(self, job: _CheckJob) -> None:
+        check = self._checks.get(job.key)
+        if check is None or check.job is not job:
+            return
+        self._resolve_check(job.key, check, job.result == "present")
+
+    def _resolve_check(self, key: BlockKey, check: _Check, present: bool) -> None:
+        del self._checks[key]
+        if check.job is not None:
+            self._inflight -= 1
+        else:
+            self._pending_count -= 1
+        for owner in check.subscribers:
+            self._sub_count -= 1
+            self._results[(owner, key)] = present
+
+    def _start_pending(self, now: float) -> None:
+        while (
+            self._pending_start
+            and self._inflight < self._options.max_inflight_checks
+            and not self._closing
+        ):
+            key = self._pending_start.popleft()
+            check = self._checks.get(key)
+            if check is not None and check.job is None:
+                self._pending_count -= 1
+                self._start_check_job(key, check, now)
+
+    def _start_check_job(self, key: BlockKey, check: _Check, now: float) -> None:
+        job = _CheckJob(key, self._name(key))
+        check.job = job
+        check.deadline = now + self._check_timeout
+        self._inflight += 1
+        if self._flavor == "file":
+            self._file.queue.put(job)
+        else:
+            self._storage.submit(job)
+
+    def lookup(
+        self, key: BlockKey, owner: str | None
+    ) -> tuple[QueryStatus, CacheTier | None]:
+        if owner is None:
+            return _MISS
+        present = self._results.get((owner, key))
+        if present is not None:
+            if present:
+                return _FETCHABLE
+            self._pop_result(key, owner)
+            return _MISS
+        check = self._checks.get(key)
+        if check is not None and owner in check.subscribers:
+            return _FETCHING
+        if self._closing:
+            return _MISS
+        held = self._sub_count + self._pending_count + len(self._results)
+        if held >= self._options.max_check_results:
+            return _MISS
+        if check is None:
+            check = self._checks[key] = _Check(None)
+            if self._inflight < self._options.max_inflight_checks:
+                self._start_check_job(key, check, self._kvcr._clock())
+            else:
+                self._pending_count += 1
+                self._pending_start.append(key)
+        check.subscribers.add(owner)
+        self._sub_count += 1
+        self._owner_keys.setdefault(owner, set()).add(key)
+        return _FETCHING
+
+    def start_check(self, keys: Collection[BlockKey], owner: str) -> None:
+        """Start or join checks for ``owner``; results are read through query."""
+        with self._kvcr._state_lock:
+            self.refresh()
+            for key in keys:
+                self.lookup(key, owner)
+
+    def _pop_result(self, key: BlockKey, owner: str) -> bool | None:
+        present = self._results.pop((owner, key), None)
+        check = self._checks.get(key)
+        if check is None or owner not in check.subscribers:
+            keys = self._owner_keys.get(owner)
+            if keys is not None:
+                keys.discard(key)
+                if not keys:
+                    del self._owner_keys[owner]
+        return present
+
+    # Reads.
+
+    def take_read_source(
+        self, key: BlockKey, owner: str | None, labels: list[str]
+    ) -> bool:
+        """Consume ``owner``'s present result when ``labels`` map to the schema."""
+        if owner is None or not self._pop_result(key, owner):
+            return False
+        return _layout_indices(self._layout, labels) is not None
+
+    def take_fill_source(
+        self, key: BlockKey, owner: str | None, labels: list[str]
+    ) -> bool:
+        return self.take_read_source(key, owner, labels)
+
+    def _make_read(
+        self, op: _G4Op, key: BlockKey, refs: list[_TransferRef]
+    ) -> _Xfer | None:
+        indices = _layout_indices(self._layout, [ref.label for ref in refs])
+        if indices is None:
+            return None
+        local = []
+        for ref in refs:
+            descriptor = self._kvcr._address_descriptor(ref)
+            if descriptor.mem_type != "DRAM":
+                return None
+            local.append((descriptor.addr, descriptor.size, descriptor.device_Id))
+        remote = [(self._offsets[index], self._sizes[index]) for index in indices]
+        return _Xfer(op, key, self._name(key), local, remote, list(refs))
+
+    def _start_reads(
+        self,
+        op: _G4Op,
+        blocks: Mapping[BlockKey, list[_TransferRef]],
+    ) -> list[BlockKey]:
+        rejected = []
+        for key, refs in blocks.items():
+            xfer = None if self._closing else self._make_read(op, key, refs)
+            if xfer is None:
+                rejected.append(key)
+                continue
+            op.xfers.append(xfer)
+        if op.xfers:
+            self._ops[op.op_id] = op
+            for xfer in op.xfers:
+                self._launch(xfer)
+        return rejected
+
+    def start_fill(
+        self,
+        op_handle: OpHandle,
+        blocks: Mapping[BlockKey, list[_TransferRef]],
+        deadline: float,
+    ) -> bool:
+        op = _G4Op(
+            op_id=("g4_fill", op_handle),
+            keys=frozenset(blocks),
+            kind="fill",
+            handle=op_handle,
+            deadline=deadline,
+        )
+        rejected = self._start_reads(op, blocks)
+        if rejected:
+            self._kvcr._local_dram.complete_fill(
+                rejected, success=False, source=CacheTier.G4
+            )
+        return True
+
+    def start_deliver(
+        self,
+        op_handle: OpHandle,
+        blocks: Mapping[BlockKey, list[_TransferRef]],
+        deadline: float,
+    ) -> None:
+        op = _G4Op(
+            op_id=("g4_deliver", op_handle),
+            keys=frozenset(blocks),
+            kind="deliver",
+            handle=op_handle,
+            deadline=deadline,
+        )
+        for key in self._start_reads(op, blocks):
+            op.results[key] = _FAILED_RESULT
+        if not op.xfers:
+            self._kvcr._complete(op_handle, op.results)
+
+    # Completion pump.
+
+    def poll_main(self) -> None:
+        failure = self._storage.failure
+        if failure is not None and not self._closing:
+            raise RuntimeError("KVCR G4 storage worker failed") from failure
+        self.refresh()
+        while True:
+            try:
+                xfer = self._op_done.get_nowait()
+            except queue.Empty:
+                break
+            self._finish_xfer(xfer)
+        now = self._kvcr._clock()
+        for op in tuple(self._ops.values()):
+            if op.ended:
+                continue
+            if not op.latched and now >= op.deadline:
+                op.latched = True
+
+    def _finish_xfer(self, xfer: _Xfer) -> None:
+        op = xfer.op
+        if xfer.finished or self._ops.get(op.op_id) is not op:
+            return
+        xfer.finished = True
+        outcome = xfer.outcome
+        done = outcome == "DONE" and not op.latched
+        if op.kind == "fill":
+            self._kvcr._local_dram.complete_fill(
+                (xfer.key,), success=done, source=CacheTier.G4
+            )
+        else:
+            op.results[xfer.key] = _SUCCESS_RESULT if done else _FAILED_RESULT
+        self._end_op_if_done(op)
+
+    def _end_op_if_done(self, op: _G4Op) -> None:
+        if op.open_xfers or self._ops.get(op.op_id) is not op:
+            return
+        if not op.ended:
+            op.ended = True
+            if op.kind == "deliver":
+                self._kvcr._complete(op.handle, op.results)
+        self._ops.pop(op.op_id)
+
     # Close.
 
     def close_workers(self) -> None:
@@ -264,4 +718,38 @@ class _G4:
             raise self._storage.failure
 
     def is_quiescent(self) -> bool:
-        return not self._storage.thread.is_alive() and not self._file.thread.is_alive()
+        return (
+            not self._storage.thread.is_alive()
+            and not self._file.thread.is_alive()
+            and not self._storage.unreleased
+        )
+
+    def close_main(self) -> None:
+        while True:
+            try:
+                xfer = self._op_done.get_nowait()
+            except queue.Empty:
+                break
+            self._finish_xfer(xfer)
+        local = self._kvcr._local_dram
+        for op in tuple(self._ops.values()):
+            self._ops.pop(op.op_id, None)
+            if op.ended:
+                continue
+            open_keys = []
+            for xfer in op.xfers:
+                if xfer.finished:
+                    continue
+                xfer.finished = True
+                open_keys.append(xfer.key)
+            if op.kind == "fill":
+                if open_keys:
+                    local.complete_fill(open_keys, success=False, source=CacheTier.G4)
+            else:
+                for key in open_keys:
+                    op.results[key] = _FAILED_RESULT
+                self._kvcr._complete(op.handle, op.results)
+        self._checks.clear()
+        self._pending_start.clear()
+        self._results.clear()
+        self._owner_keys.clear()
