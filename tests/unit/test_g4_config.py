@@ -3,6 +3,8 @@
 """G4 configuration, startup rejections and environment handling."""
 
 import ctypes
+import errno
+import os
 from pathlib import Path
 
 import pytest
@@ -16,7 +18,7 @@ from _g4_test_utils import (
 )
 
 from kvcr.config import KVCRConfig, KVCRGuardConfig, LocalDramOptions
-from kvcr.types import CacheTier, RegionDescriptor
+from kvcr.types import BlockKey, CacheTier, RegionDescriptor
 
 DOCS = Path(__file__).resolve().parents[2] / "docs" / "g4.md"
 
@@ -169,6 +171,60 @@ def test_g4_backend_creation_failure_names_the_nixl_module_knob(
         new_world(g4env, tmp_path, flavor="object", options=options)
 
 
+# ---- O_DIRECT default and startup check (Q13) ----
+
+
+def _refuse_o_direct(monkeypatch):
+    real = os.open
+
+    def refusing(path, flags, *args, **kwargs):
+        if flags & os.O_DIRECT:
+            raise OSError(errno.EINVAL, "Invalid argument", os.fspath(path))
+        return real(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", refusing)
+
+
+def test_g4_file_root_refusing_o_direct_fails_startup_by_default(
+    g4env, tmp_path, monkeypatch
+):
+    from kvcr.config import G4Options
+
+    root = tmp_path / "g4root"
+    root.mkdir()
+    _refuse_o_direct(monkeypatch)
+    options = G4Options(flavor="file", key_prefix="p", key_layout=("",), root=root)
+    with pytest.raises(Exception) as caught:
+        new_world(g4env, tmp_path, flavor="file", root=root, options=options)
+    message = str(caught.value)
+    assert "direct_io" in message or "O_DIRECT" in message
+    assert str(root) in message
+
+
+def test_g4_file_root_refusing_o_direct_fails_startup_with_direct_io_true(
+    g4env, tmp_path, monkeypatch
+):
+    root = tmp_path / "g4root"
+    root.mkdir()
+    _refuse_o_direct(monkeypatch)
+    with pytest.raises(Exception) as caught:
+        new_world(g4env, tmp_path, flavor="file", root=root, direct_io=True)
+    message = str(caught.value)
+    assert "direct_io" in message or "O_DIRECT" in message
+    assert str(root) in message
+
+
+def test_g4_file_root_refusing_o_direct_starts_with_direct_io_false(
+    g4env, tmp_path, monkeypatch
+):
+    root = tmp_path / "g4root"
+    root.mkdir()
+    _refuse_o_direct(monkeypatch)
+    w = new_world(g4env, tmp_path, flavor="file", root=root, direct_io=False)
+    w.spill(BlockKey(b"a"), 0)
+    assert w.stored(BlockKey(b"a"))
+
+
 # ---- Documentation (AC10) ----
 
 
@@ -202,6 +258,6 @@ def test_g4_options_defaults():
     assert options.check_batch_max == 32
     assert options.spill_timeout_ms is None
     assert options.miss_backoff_ms == 1_000
-    assert options.direct_io is False
+    assert options.direct_io is True
     assert options.failure_threshold == 5
     assert options.backoff_ms == 10_000
