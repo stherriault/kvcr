@@ -763,6 +763,23 @@ class _G4:
             if region.mem_type == "DRAM"
         ]
 
+    def check_dram_alignment(self) -> None:
+        """Refuse DRAM regions that O_DIRECT transfers cannot use."""
+        if self._flavor != "file" or not self._options.direct_io:
+            return
+        page = os.sysconf("SC_PAGE_SIZE")
+        for region in self._dram_regions():
+            fields = {"address": region.addr, "size": region.size}
+            if region.stride:
+                fields["stride"] = region.stride
+            bad = [name for name, value in fields.items() if value % page]
+            if bad:
+                raise ValueError(
+                    f"G4 direct_io needs page aligned DRAM regions: region "
+                    f"{region.label!r} at {region.addr:#x} has {' and '.join(bad)} "
+                    f"not a multiple of {page}; align it or set direct_io=False"
+                )
+
     def start(self, timeout: float) -> None:
         self._storage.thread.start()
         if self._file is not None:

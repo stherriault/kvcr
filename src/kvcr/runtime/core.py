@@ -359,6 +359,8 @@ class _KVCRCore:
         )
         self._memory_regions = (framework_regions, kvcr_regions)
         _validate_memory_regions([*framework_regions.values(), *kvcr_regions.values()])
+        if self._g4 is not None:
+            self._g4.check_dram_alignment()
         dram_backends: set[str] = set()
         if self._local_dram is not None:
             dram_backends.add(local_dram_config.backend)
