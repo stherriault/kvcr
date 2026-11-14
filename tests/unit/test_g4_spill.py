@@ -549,6 +549,99 @@ def test_g4_open_breaker_fails_reads_with_results_without_io(g4env, tmp_path, fl
     assert len(w.storage.log("READ")) == reads
 
 
+# ---- File read-error re-stat probe (D14) ----
+
+SENTINEL = BlockKey(b"after-the-probe")
+
+
+def _file_read_error(w, change=None, *, gate=False):
+    """Fail a file READ with ERR; `change` edits the block file while it is held.
+
+    Returns the gate that holds the re-stat probe, or None without `gate`.
+    """
+    w.spill(A, 0)
+    _present(w, A)
+    w.storage.outcome["READ"] = "HOLD"
+    handle = w.deliver(A, 4)
+    wait_for(lambda: len(w.storage.held("READ")) == 1)
+    (path,) = find_files(w.root, A)
+    if change is not None:
+        change(path)
+    held = None
+    if gate:
+        held = threading.Event()
+        w.env.gates.append(held)
+        w.stat_gate = held
+    w.stats_before = len(w.stat_log)
+    w.storage.finish_all("ERR")
+    assert not w.wait(handle)[A].success
+    return held
+
+
+def _probe_answered(w):
+    """Wait for the probe stat, then for a later file job to pass behind it."""
+    wait_for(lambda: len(w.stat_log) > w.stats_before)
+    wait_for(lambda: w.blocked_checks() == 0)
+    assert w.await_check(SENTINEL) == MISS
+
+
+def _unlink(path):
+    path.unlink()
+
+
+def _rename_over(path):
+    other = path.with_name("replacement")
+    other.write_bytes(path.read_bytes())
+    os.replace(other, path)
+
+
+def test_g4_file_read_error_on_an_absent_file_does_not_count(g4env, tmp_path):
+    w = new_world(g4env, tmp_path, flavor="file", failure_threshold=1)
+    _file_read_error(w, _unlink)
+    _probe_answered(w)
+    assert not _is_open(w)
+
+
+def test_g4_file_read_error_on_a_replaced_file_does_not_count(g4env, tmp_path):
+    w = new_world(g4env, tmp_path, flavor="file", failure_threshold=1)
+    _file_read_error(w, _rename_over)
+    _probe_answered(w)
+    assert not _is_open(w)
+
+
+def test_g4_file_read_error_on_the_same_file_counts_once_the_probe_answers(
+    g4env, tmp_path
+):
+    w = new_world(g4env, tmp_path, flavor="file", failure_threshold=1)
+    _file_read_error(w)
+    _probe_answered(w)
+    w.poll_until(lambda: _is_open(w))
+
+
+def test_g4_file_read_error_count_waits_for_the_probe_answer(g4env, tmp_path):
+    w = new_world(g4env, tmp_path, flavor="file", failure_threshold=1)
+    gate = _file_read_error(w, gate=True)
+    wait_for(lambda: w.blocked_checks() == 1)
+    assert not _is_open(w)
+    gate.set()
+    w.poll_until(lambda: _is_open(w))
+
+
+def test_g4_file_read_error_counts_when_the_probe_stat_fails(g4env, tmp_path):
+    w = new_world(g4env, tmp_path, flavor="file", failure_threshold=1)
+    w.spill(A, 0)
+    _present(w, A)
+    w.storage.outcome["READ"] = "HOLD"
+    handle = w.deliver(A, 4)
+    wait_for(lambda: len(w.storage.held("READ")) == 1)
+    stats = len(w.stat_log)
+    w.stat_error = True
+    w.storage.finish_all("ERR")
+    assert not w.wait(handle)[A].success
+    wait_for(lambda: len(w.stat_log) > stats)
+    w.poll_until(lambda: _is_open(w))
+
+
 # ---- Breaker and existence checks (AC4, AC6) ----
 
 
