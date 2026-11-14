@@ -867,12 +867,12 @@ def new_hybrid_world(
     world.root = tmp_path / "g4root"
     world.root.mkdir(exist_ok=True)
     world.primary = {
-        "full": ctypes.create_string_buffer(6 * PAGE),
-        "swa": ctypes.create_string_buffer(6 * PAGE),
+        "full": aligned(6 * PAGE),
+        "swa": aligned(6 * PAGE),
     }
     world.local_bufs = {
-        "full": ctypes.create_string_buffer(2 * PAGE),
-        "swa": ctypes.create_string_buffer(2 * PAGE),
+        "full": aligned(2 * PAGE),
+        "swa": aligned(2 * PAGE),
     }
     for index in range(3):
         world.primary["full"][index * 2 * PAGE : (index + 1) * 2 * PAGE] = pattern(
