@@ -87,6 +87,7 @@ class _CheckJob:
     key: BlockKey
     name: str
     probe_op: "_G4Op | None" = None
+    file_id: tuple[int, int] | None = None
     started: bool = False
     cancelled: bool = False
     batch: int | None = None
@@ -113,6 +114,7 @@ class _Xfer:
     tmp: str | None = None
     fd: int | None = None
     fd_closed: bool = False
+    file_id: tuple[int, int] | None = None
     reg: Any = None
     handle: Any = None
     start_failed: bool = False
@@ -502,11 +504,14 @@ class _FileWorker:
         except OSError:
             job.result = "error"
         else:
-            job.result = (
-                "present"
-                if stat.S_ISREG(info.st_mode) and info.st_size == self._g4._payload_len
-                else "absent"
-            )
+            if job.probe_op is not None:
+                # A probe asks whether the read file is still the one in place.
+                same = (info.st_dev, info.st_ino) == job.file_id
+                job.result = "present" if same else "absent"
+            elif stat.S_ISREG(info.st_mode) and info.st_size == self._g4._payload_len:
+                job.result = "present"
+            else:
+                job.result = "absent"
         self._g4._check_done.put(job)
 
     def _open(self, xfer: _Xfer) -> None:
@@ -542,12 +547,13 @@ class _FileWorker:
             return
         xfer.fd = fd
         try:
-            size = os.fstat(fd).st_size
+            info = os.fstat(fd)
         except OSError:
             xfer.outcome = "ERR"
             self._finish(xfer)
             return
-        if size != g4._payload_len:
+        xfer.file_id = (info.st_dev, info.st_ino)
+        if info.st_size != g4._payload_len:
             xfer.outcome = "ABSENT"
             self._finish(xfer)
             return
@@ -1160,6 +1166,12 @@ class _G4:
                 # A probe decides whether the block vanished or storage failed.
                 op.probes += 1
                 self._storage.submit(_CheckJob(xfer.key, xfer.name, probe_op=op))
+            elif xfer.file_id is not None and not xfer.start_failed and not op.counted:
+                # A re-stat decides whether the file was removed or replaced.
+                op.probes += 1
+                self._file.queue.put(
+                    _CheckJob(xfer.key, xfer.name, probe_op=op, file_id=xfer.file_id)
+                )
             else:
                 self._count_failure(op)
         if op.kind == "fill":
