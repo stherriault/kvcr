@@ -95,7 +95,6 @@ class G4Options(msgspec.Struct, frozen=True, kw_only=True):
     check_timeout_ms: int | None = None
     check_batch_max: int = 32
     spill_timeout_ms: int | None = None
-    miss_backoff_ms: int = 1_000
     direct_io: bool = True
     failure_threshold: int = 5
     backoff_ms: int = 10_000
