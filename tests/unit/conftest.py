@@ -55,6 +55,7 @@ _DROP2_WORDS = ("obj", "aws", "nixl_module", "head", "probe", "devid")
 _PENDING_D5 = (
     "miss_backoff_suppresses_repeat_checks",
     "own_publish_clears_the_miss_backoff",
+    "max_check_results_miss_does_not_arm_the_miss_backoff",
 )
 
 
@@ -83,6 +84,7 @@ def pytest_collection_modifyitems(items):
         name = item.originalname or item.name
         if any(name.endswith(pending) for pending in _PENDING_D5):
             item.add_marker(pytest.mark.pending_d5)
+            item.add_marker(pytest.mark.skip(reason="D5: no miss backoff in drop 1"))
             continue
         item.add_marker(
             pytest.mark.drop2 if _is_object_test(item) else pytest.mark.drop1

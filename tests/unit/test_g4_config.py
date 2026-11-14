@@ -248,6 +248,14 @@ def test_g4_docs_cover_the_required_topics():
     assert missing == []
 
 
+def test_g4_options_have_no_miss_backoff_option():
+    from kvcr.config import G4Options
+
+    assert "miss_backoff_ms" not in G4Options.__struct_fields__
+    with pytest.raises(TypeError):
+        G4Options(flavor="object", key_prefix="p", key_layout=("",), miss_backoff_ms=0)
+
+
 def test_g4_options_defaults():
     from kvcr.config import G4Options
 
@@ -257,7 +265,6 @@ def test_g4_options_defaults():
     assert options.check_timeout_ms is None
     assert options.check_batch_max == 32
     assert options.spill_timeout_ms is None
-    assert options.miss_backoff_ms == 1_000
     assert options.direct_io is True
     assert options.failure_threshold == 5
     assert options.backoff_ms == 10_000

@@ -658,9 +658,7 @@ def test_g4_check_errors_count_toward_the_breaker(g4env, tmp_path, flavor):
 def test_g4_check_deadline_gives_miss_to_every_subscriber_and_drops_the_late_answer(
     g4env, tmp_path, flavor
 ):
-    w = new_world(
-        g4env, tmp_path, flavor=flavor, failure_threshold=2, miss_backoff_ms=1000
-    )
+    w = new_world(g4env, tmp_path, flavor=flavor, failure_threshold=2)
     w.spill(A, 0)
     gate = w.hold_checks()
     assert w.kvcr.query([A], "a") == [fetching_g4()]

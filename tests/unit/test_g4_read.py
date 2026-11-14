@@ -744,10 +744,21 @@ def test_g4_sixty_five_keys_from_two_requests_all_end_fetchable(
 
 
 @pytest.mark.parametrize("flavor", FLAVORS)
-def test_g4_max_check_results_misses_new_lookups_without_backoff(
+def test_g4_max_check_results_misses_new_lookups(g4env, tmp_path, flavor):
+    w = new_world(g4env, tmp_path, flavor=flavor, max_check_results=2)
+    w.hold_checks()
+    assert w.kvcr.query([A], "a") == [fetching_g4()]
+    assert w.kvcr.query([A], "b") == [fetching_g4()]
+    assert w.kvcr.query([A], "c") == [(QueryStatus.MISS, None)]
+    w.kvcr.discard_hint("a")
+    w.kvcr.discard_hint("b")
+    assert w.kvcr.query([A], "c") == [fetching_g4()]
+
+
+@pytest.mark.parametrize("flavor", FLAVORS)
+def test_g4_max_check_results_miss_does_not_arm_the_miss_backoff(
     g4env, tmp_path, flavor
 ):
-    # The backoff part applies only if D5 keeps miss backoff.
     w = new_world(
         g4env, tmp_path, flavor=flavor, max_check_results=2, miss_backoff_ms=1000
     )

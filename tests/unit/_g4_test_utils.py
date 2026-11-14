@@ -545,7 +545,6 @@ class _MoveToG4Policy(FIFOPolicy):
 def g4_options(flavor: str, root: Path | None, key_layout=None, **kwargs):
     from kvcr.config import G4Options
 
-    kwargs.setdefault("miss_backoff_ms", 0)
     # The suite runs on any tmp_path, which may refuse O_DIRECT.
     kwargs.setdefault("direct_io", False)
     if flavor == "object":
