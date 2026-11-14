@@ -716,6 +716,25 @@ class _G4:
         finally:
             with contextlib.suppress(OSError):
                 os.unlink(tmp)
+        if self._options.direct_io:
+            self._probe_direct_io(directory)
+
+    def _probe_direct_io(self, directory: Path) -> None:
+        # Opening a directory with O_DIRECT succeeds on file systems that
+        # refuse it for files, so the check opens a file.
+        path = directory / f".probe.direct.{self._temp_suffix()}"
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_DIRECT
+        try:
+            os.close(os.open(path, flags, 0o644))
+            os.close(os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECT))
+        except OSError as error:
+            raise ValueError(
+                f"G4 root {self._root} does not accept O_DIRECT ({error}); "
+                "set direct_io=False to use buffered I/O"
+            ) from error
+        finally:
+            with contextlib.suppress(OSError):
+                os.unlink(path)
 
     @staticmethod
     def _temp_suffix() -> str:
