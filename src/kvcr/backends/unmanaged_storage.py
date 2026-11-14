@@ -695,7 +695,7 @@ class _G4:
         self.spill_late = 0
         self.spill_dropped = 0
         self._storage = _StorageWorker(self)
-        self._file = _FileWorker(self)
+        self._file = _FileWorker(self) if self._flavor == "file" else None
 
     # Startup and naming.
 
@@ -765,7 +765,8 @@ class _G4:
 
     def start(self, timeout: float) -> None:
         self._storage.thread.start()
-        self._file.thread.start()
+        if self._file is not None:
+            self._file.thread.start()
         if not self._storage.ready.wait(timeout):
             raise RuntimeError(f"G4 storage worker did not start within {timeout:g}s")
         if self._storage.error is not None:
@@ -1290,13 +1291,14 @@ class _G4:
         """Drop unstarted jobs, let started transfers end, and join both workers."""
         self._closing = True
         self._storage.stop()
-        self._file.stop()
+        if self._file is not None:
+            self._file.stop()
         timeout = _progress._OP_CLEANUP_TIMEOUT_SECONDS
         for worker, bound in (
             (self._storage, timeout + _progress._JOIN_TIMEOUT_SECONDS),
             (self._file, timeout),
         ):
-            if worker.thread.ident is not None:
+            if worker is not None and worker.thread.ident is not None:
                 worker.thread.join(timeout=bound)
         storage = self._storage
         # A blocking query_memory has a known upper bound; wait it out.
@@ -1315,7 +1317,7 @@ class _G4:
                 storage.thread.join, timeout + _progress._JOIN_TIMEOUT_SECONDS
             )
             raise RuntimeError("G4 storage worker did not stop")
-        if self._file.thread.is_alive():
+        if self._file is not None and self._file.thread.is_alive():
             raise RuntimeError("G4 file worker did not stop")
         if self._storage.failure is not None:
             raise self._storage.failure
@@ -1323,7 +1325,7 @@ class _G4:
     def is_quiescent(self) -> bool:
         return (
             not self._storage.thread.is_alive()
-            and not self._file.thread.is_alive()
+            and (self._file is None or not self._file.thread.is_alive())
             and not self._storage.unreleased
         )
 
