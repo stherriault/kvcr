@@ -198,3 +198,30 @@ def test_g4_close_raises_while_a_transfer_never_terminates(
     assert w.storage.live_dev
     w.storage.finish_all("DONE")
     _OPEN_KVCRS.remove(w.kvcr)
+
+
+# ---- File worker thread exists only for the file flavor (D12) ----
+
+
+def _file_workers():
+    return [
+        t for t in threading.enumerate() if t.name == "kvcr-g4-file" and t.is_alive()
+    ]
+
+
+def test_g4_object_flavor_runs_no_file_worker_thread(g4env, tmp_path):
+    w = new_world(g4env, tmp_path, flavor="object")
+    w.spill(A, 0)
+    assert w.await_check(A) == fetchable_g4()
+    assert _file_workers() == []
+    w.kvcr.close()
+    assert _file_workers() == []
+
+
+def test_g4_file_flavor_runs_one_file_worker_thread_until_close(g4env, tmp_path):
+    threads = threading.active_count()
+    w = new_world(g4env, tmp_path, flavor="file")
+    assert len(_file_workers()) == 1
+    w.kvcr.close()
+    assert _file_workers() == []
+    assert threading.active_count() == threads
