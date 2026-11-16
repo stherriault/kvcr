@@ -9,10 +9,12 @@ File transfers run against real files, so the file flavor is exercised
 end to end except for the NIXL transfer itself.
 """
 
+import contextlib
 import ctypes
 import errno
 import fcntl
 import hashlib
+import itertools
 import mmap
 import os
 import sys
@@ -30,6 +32,7 @@ from _kvcr_test_utils import (
     FakeBytesControl,
     FakeNixlAgent,
     FakePrimaryPinning,
+    FakeTelemetryStats,
     _mem_descriptor,
 )
 
@@ -59,6 +62,23 @@ PREFIX = "kvcr/unit/model-a/base/bf16"
 ERROR_XML = b"<Error><Code>NoSuchKey</Code></Error>"
 FAKE_MODULE = "kvcr_unit_fake_nixl"
 WAIT_SECONDS = 3.0
+# What a failing check reports, per flavor (the file flavor fails with EIO).
+CHECK_ERROR_TEXT = {"file": "check failed"}
+
+
+_PROBES = itertools.count()
+
+
+class WorkerCrash(BaseException):
+    """Raised from a fake agent call; nothing in the worker loop catches it."""
+
+
+def crash_on(method: str) -> Callable[[str], None]:
+    def fault(name: str) -> None:
+        if name == method:
+            raise WorkerCrash(f"{method} crashed")
+
+    return fault
 
 
 def fetching_g4():
@@ -688,6 +708,12 @@ class World:
         """Storage calls made for checks."""
         return len(self.stat_log)
 
+    def fail_checks(self) -> None:
+        self.stat_error = True
+
+    def heal_checks(self) -> None:
+        self.stat_error = False
+
     def query_only(self, key: BlockKey, rid: str = "r"):
         """Wait for a check result using query alone, never poll_completed."""
         deadline = time.monotonic() + WAIT_SECONDS
@@ -698,6 +724,41 @@ class World:
             if time.monotonic() > deadline:
                 raise AssertionError("check result never reached query")
             time.sleep(0.001)
+
+    def abandon(self) -> None:
+        """Close after a worker crash, which may leave handles unreleased."""
+        with contextlib.suppress(Exception, WorkerCrash):
+            self.kvcr.close()
+        if self.kvcr in _OPEN_KVCRS:
+            _OPEN_KVCRS.remove(self.kvcr)
+
+    def g4_state(self) -> dict[str, int]:
+        return self.kvcr._core._g4.telemetry_state()
+
+    def metrics(self) -> dict[tuple, int | float]:
+        """Recorded telemetry summed by (kind, name, *labels); empty if disabled."""
+        stats = self.kvcr.get_stats()
+        totals: dict[tuple, int | float] = {}
+        for kind, name, value, labels in getattr(stats, "records", []):
+            key = (kind, name, *labels)
+            totals[key] = totals.get(key, 0) + value
+        return totals
+
+    def breaker_open(self) -> bool:
+        """True while the breaker refuses checks and data (not half-open).
+
+        Reads the breaker gauge; a build without the gauge is probed with a
+        fresh query, which an open breaker answers MISS without a check.
+        """
+        self.settle(20)
+        state = self.g4_state().get("g4_breaker_state")
+        if state is not None:
+            return state == 1
+        key = BlockKey(b"breaker-probe-%d" % next(_PROBES))
+        calls = self.check_calls()
+        answer = self.kvcr.query([key], "breaker-probe")[0]
+        self.settle(5)
+        return answer == (QueryStatus.MISS, None) and self.check_calls() == calls
 
     @property
     def local_dram(self):
@@ -732,6 +793,7 @@ def build_kvcr(
             framework_control=control,
             policy=policy,
             on_resilience_event=on_resilience_event,
+            stats_factory=(FakeTelemetryStats if config.enable_telemetry else None),
         ),
         KVCRBackendConfigs(
             framework_regions=framework_regions,
@@ -761,6 +823,7 @@ def new_world(
     pages: int = 1,
     options=None,
     storage_setup: Callable[[FakeG4Agent], None] | None = None,
+    telemetry: bool = False,
     **g4_kwargs,
 ) -> World:
     """Single-pool world: one block is `pages` pages, `slots` G2 slots.
@@ -794,7 +857,11 @@ def new_world(
         env,
         main=world.main,
         storage=world.storage,
-        config=KVCRConfig(nixl_agent_name=name, pool_layouts=[("", block)]),
+        config=KVCRConfig(
+            nixl_agent_name=name,
+            pool_layouts=[("", block)],
+            enable_telemetry=telemetry,
+        ),
         framework_regions=[
             RegionDescriptor(
                 addr=ctypes.addressof(world.engine), size=block, label="", count=8
@@ -912,6 +979,7 @@ def hybrid_block_bytes(world: World, index: int) -> bytes:
 
 
 __all__ = [
+    "CHECK_ERROR_TEXT",
     "ERROR_XML",
     "NixlBackendError",
     "FakeG4Agent",
@@ -921,7 +989,9 @@ __all__ = [
     "PAGE",
     "PREFIX",
     "World",
+    "WorkerCrash",
     "build_kvcr",
+    "crash_on",
     "fetchable_g4",
     "fetching_g4",
     "find_files",

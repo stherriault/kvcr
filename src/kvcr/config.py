@@ -80,7 +80,12 @@ class G4Options(msgspec.Struct, frozen=True, kw_only=True):
     max_inflight_checks: int = 64
     max_check_results: int = 65_536
     check_timeout_ms: int | None = None
+    spill_timeout_ms: int | None = None
     direct_io: bool = True
+    failure_threshold: int = 5
+    backoff_ms: int = 10_000
+    # Total time close() waits for the G4 workers before it raises.
+    close_timeout_ms: int = 30_000
 
 
 class KVCRBackendConfigs(msgspec.Struct, frozen=True):
