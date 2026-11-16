@@ -93,6 +93,8 @@ class KVCR:
         claimed: _recovery.ClaimedPool | None = None
         pool_hold: KVCRPoolHold | None = None
         core: _KVCRCore | None = None
+        if guard_config is not None and backend_configs.g4 is not None:
+            raise ValueError("guard recovery cannot be combined with G4 storage")
         try:
             if guard_config is None:
                 core = _KVCRCore(config, bindings, backend_configs)

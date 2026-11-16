@@ -74,6 +74,8 @@ class G4Options(msgspec.Struct, frozen=True, kw_only=True):
     key_prefix: str
     key_layout: tuple[str, ...]
     root: Path | None = None
+    backend: str = ""
+    backend_options: Mapping[str, str] = msgspec.field(default_factory=dict)
 
 
 class KVCRBackendConfigs(msgspec.Struct, frozen=True):
