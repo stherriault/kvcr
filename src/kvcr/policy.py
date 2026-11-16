@@ -154,3 +154,18 @@ class G3LRUPolicy(LRUPolicy):
         if source is CacheTier.LOCAL_G2:
             return (PlacementAction.MOVE_TO, CacheTier.G3)
         return super().decide_eviction(meta, source)
+
+
+class G4LRUPolicy(LRUPolicy):
+    """Built-in LRU policy that spills local DRAM into configured G4 storage."""
+
+    required_tiers = LRUPolicy.required_tiers | {CacheTier.G4}
+
+    def decide_eviction(
+        self,
+        meta: BlockMeta,
+        source: CacheTier,
+    ) -> PlacementDecision:
+        if source is CacheTier.LOCAL_G2:
+            return (PlacementAction.MOVE_TO, CacheTier.G4)
+        return super().decide_eviction(meta, source)

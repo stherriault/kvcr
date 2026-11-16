@@ -33,7 +33,7 @@ from ..config import (
 )
 from ..hints.dispatcher import HintDispatcher
 from ..hints.hint_handler import _IndependentHintHandler
-from ..policy import G3LRUPolicy, LRUPolicy
+from ..policy import G3LRUPolicy, G4LRUPolicy, LRUPolicy
 from ..types import (
     BlockKey,
     BlockMeta,
@@ -235,7 +235,17 @@ class _KVCRCore:
             raise ValueError("G4 requires configured local DRAM")
         policy = bindings.policy
         if policy is None:
-            policy = G3LRUPolicy() if g3_config is not None else LRUPolicy()
+            if g3_config is not None:
+                policy = G3LRUPolicy()
+                if g4_config is not None:
+                    logger.info(
+                        "KVCR default policy is G3LRUPolicy with G3 configured; "
+                        "G4 receives no spills unless a policy moves blocks to G4"
+                    )
+            elif g4_config is not None:
+                policy = G4LRUPolicy()
+            else:
+                policy = LRUPolicy()
         configured_tiers = set()
         if local_dram_config is not None:
             configured_tiers.add(CacheTier.LOCAL_G2)

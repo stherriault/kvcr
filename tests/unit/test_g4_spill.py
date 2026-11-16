@@ -127,6 +127,22 @@ def test_g4_spill_start_failure_retires_the_source_and_the_deposit_lands(
     assert w.storage.unreleased() == []
 
 
+# ---- Policy wiring ----
+
+
+def test_g4_lru_policy_moves_local_g2_victims_to_g4():
+    from kvcr.policy import G4LRUPolicy
+    from kvcr.types import BlockMeta
+
+    meta = BlockMeta(A, PAGE, 1, 0.0, frozenset({CacheTier.LOCAL_G2}))
+    policy = G4LRUPolicy()
+    assert policy.decide_eviction(meta, CacheTier.LOCAL_G2) == (
+        PlacementAction.MOVE_TO,
+        CacheTier.G4,
+    )
+    assert CacheTier.G4 in policy.required_tiers
+
+
 # ---- Atomic publish ----
 
 
