@@ -98,7 +98,7 @@ class G4Options(msgspec.Struct, frozen=True, kw_only=True):
     direct_io: bool = True
     failure_threshold: int = 5
     backoff_ms: int = 10_000
-    # Total time close() waits for the G4 workers before it raises.
+    # Total time close() waits for the G4 storage worker before it raises.
     close_timeout_ms: int = 30_000
 
     def __repr__(self) -> str:

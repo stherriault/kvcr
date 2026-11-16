@@ -207,48 +207,26 @@ def test_g4_close_raises_while_a_transfer_never_terminates(
     _OPEN_KVCRS.remove(w.kvcr)
 
 
-# ---- File worker thread exists only for the file flavor ----
+# ---- One G4 thread for both flavors ----
 
 
-def _file_workers():
+def _g4_threads():
     return [
-        t for t in threading.enumerate() if t.name == "kvcr-g4-file" and t.is_alive()
-    ]
-
-
-def test_g4_object_flavor_runs_no_file_worker_thread(g4env, tmp_path):
-    w = new_world(g4env, tmp_path, flavor="object")
-    w.spill(A, 0)
-    assert w.await_check(A) == fetchable_g4()
-    assert _file_workers() == []
-    w.kvcr.close()
-    assert _file_workers() == []
-
-
-def test_g4_file_flavor_runs_one_file_worker_thread_until_close(g4env, tmp_path):
-    threads = threading.active_count()
-    w = new_world(g4env, tmp_path, flavor="file")
-    assert len(_file_workers()) == 1
-    w.kvcr.close()
-    assert _file_workers() == []
-    assert threading.active_count() == threads
-
-
-def _check_workers():
-    return [
-        t for t in threading.enumerate() if t.name == "kvcr-g4-check" and t.is_alive()
+        t
+        for t in threading.enumerate()
+        if t.name.startswith("kvcr-g4") and t.is_alive()
     ]
 
 
 @pytest.mark.parametrize("flavor", ["object", "file"])
-def test_g4_check_worker_thread_runs_for_each_flavor_until_close(
-    g4env, tmp_path, flavor
-):
+def test_g4_runs_one_storage_thread_until_close(g4env, tmp_path, flavor):
     threads = threading.active_count()
     w = new_world(g4env, tmp_path, flavor=flavor)
-    assert len(_check_workers()) == 1
+    w.spill(A, 0)
+    assert w.await_check(A) == fetchable_g4()
+    assert [t.name for t in _g4_threads()] == ["kvcr-g4-storage"]
     w.kvcr.close()
-    assert _check_workers() == []
+    assert _g4_threads() == []
     assert threading.active_count() == threads
 
 
@@ -264,6 +242,10 @@ def _g4_warnings(caplog):
         for record in caplog.records
         if record.levelno >= logging.WARNING and "g4" in record.getMessage().lower()
     ]
+
+
+def _off_warnings(caplog):
+    return [r for r in _g4_warnings(caplog) if "until restart" in r.getMessage()]
 
 
 def _held_read(w):
@@ -398,7 +380,7 @@ def test_g4_storage_worker_crash_before_the_post_frees_the_fill_slot(g4env, tmp_
 
 
 @pytest.mark.parametrize("flavor", ["object", "file"])
-def test_g4_check_worker_crash_lets_an_in_flight_read_finish(
+def test_g4_worker_death_inside_query_memory_fails_the_open_read_and_disables_g4(
     g4env, tmp_path, caplog, flavor
 ):
     w = new_world(g4env, tmp_path, flavor=flavor)
@@ -407,37 +389,42 @@ def test_g4_check_worker_crash_lets_an_in_flight_read_finish(
         handle = _held_read(w)
         w.storage.fault = crash_on("query_memory")
         assert w.kvcr.query([D], "x") == [fetching_g4()]
+        assert not w.wait(handle)[A].success
         w.poll_until(lambda: w.kvcr.query([D], "x") == [MISS])
+        assert len(_off_warnings(caplog)) == 1
         warned = len(_g4_warnings(caplog))
-        assert warned >= 1
-        w.storage.finish_all("DONE")
-        assert w.wait(handle)[A].success
+        # The read it posted was never released, so its memory stays pinned.
+        assert w.storage.unreleased()
+        assert not w.kvcr._core.is_quiescent()
+        # Other tiers go on.
+        assert w.deposit(B, 1).success
+        assert w.kvcr.query([B])[0] == (QueryStatus.HIT, CacheTier.LOCAL_G2)
         for _ in range(30):
             w.poll()
             assert w.kvcr.query([D], "q") == [MISS]
         assert len(_g4_warnings(caplog)) == warned
-        assert w.deposit(B, 1).success
     finally:
         w.abandon()
 
 
 @pytest.mark.parametrize("flavor", ["object", "file"])
-def test_g4_check_worker_crash_lets_an_in_flight_fill_complete(g4env, tmp_path, flavor):
+def test_g4_worker_death_inside_query_memory_keeps_a_posted_fill_slot_pinned(
+    g4env, tmp_path, flavor
+):
     w = new_world(g4env, tmp_path, flavor=flavor)
     try:
         handle = _held_fill(w)
         w.storage.fault = crash_on("query_memory")
         assert w.kvcr.query([D], "x") == [fetching_g4()]
-        w.poll_until(lambda: w.kvcr.query([D], "x") == [MISS])
-        w.storage.finish_all("DONE")
-        assert w.wait(handle)[A].success
-        assert w.kvcr.query([A])[0] == (QueryStatus.HIT, CacheTier.LOCAL_G2)
+        assert not w.wait(handle)[A].success
+        assert w.kvcr.query([A])[0][0] is not QueryStatus.HIT
+        assert _deposit_cannot_land(w, B, 1)
     finally:
         w.abandon()
 
 
 def _fail_file_open_once(monkeypatch, match, error=RuntimeError):
-    """Make the file worker's open of a matching path raise something unexpected."""
+    """Make the storage worker's open of a matching path raise something unexpected."""
     real = os.open
     me = threading.get_ident()
     fired = []
@@ -445,14 +432,14 @@ def _fail_file_open_once(monkeypatch, match, error=RuntimeError):
     def flaky(path, *args, **kwargs):
         if threading.get_ident() != me and match(str(path)) and not fired:
             fired.append(path)
-            raise error("unexpected file worker fault")
+            raise error("unexpected file fault")
         return real(path, *args, **kwargs)
 
     monkeypatch.setattr(os, "open", flaky)
     return fired
 
 
-def test_g4_file_worker_fault_on_a_read_ends_that_op_and_the_worker_goes_on(
+def test_g4_file_fault_on_a_read_ends_that_op_and_the_worker_goes_on(
     g4env, tmp_path, monkeypatch
 ):
     w = new_world(g4env, tmp_path, flavor="file")
@@ -466,7 +453,7 @@ def test_g4_file_worker_fault_on_a_read_ends_that_op_and_the_worker_goes_on(
     assert w.wait(w.deliver(B, 5, "rb"), timeout=1.0)[B].success
 
 
-def test_g4_file_worker_fault_on_a_spill_ends_that_op_and_the_worker_goes_on(
+def test_g4_file_fault_on_a_spill_ends_that_op_and_the_worker_goes_on(
     g4env, tmp_path, monkeypatch
 ):
     w = new_world(g4env, tmp_path, flavor="file")
@@ -480,10 +467,11 @@ def test_g4_file_worker_fault_on_a_spill_ends_that_op_and_the_worker_goes_on(
     assert w.stored(C)
 
 
-def test_g4_file_worker_death_before_a_read_opens_fails_it_and_disables_g4(
-    g4env, tmp_path, monkeypatch
+def test_g4_worker_death_inside_a_file_open_for_a_read_fails_it_and_disables_g4(
+    g4env, tmp_path, monkeypatch, caplog
 ):
     w = new_world(g4env, tmp_path, flavor="file")
+    caplog.set_level(logging.WARNING)
     try:
         w.spill(A, 0)
         assert w.await_check(A, "r") == fetchable_g4()
@@ -493,11 +481,14 @@ def test_g4_file_worker_death_before_a_read_opens_fails_it_and_disables_g4(
         assert not w.wait(w.deliver(A, 4, "r"), timeout=2.0)[A].success
         w.poll_until(lambda: w.kvcr.query([D], "q") == [MISS])
         assert w.deposit(B, 1).success
+        for _ in range(30):
+            w.poll()
+        assert len(_off_warnings(caplog)) == 1
     finally:
         w.abandon()
 
 
-def test_g4_file_worker_death_before_a_spill_opens_frees_the_source(
+def test_g4_worker_death_inside_a_file_open_for_a_spill_frees_the_source(
     g4env, tmp_path, monkeypatch
 ):
     w = new_world(g4env, tmp_path, flavor="file")

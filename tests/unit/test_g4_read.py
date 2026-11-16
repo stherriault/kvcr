@@ -6,6 +6,7 @@ import ctypes
 import hashlib
 import os
 import re
+import stat
 import threading
 import time
 from unittest.mock import patch
@@ -475,56 +476,59 @@ def test_g4_query_makes_no_storage_call_on_the_caller_thread(
     assert caller_storage == [] and caller_main == []
 
 
-def test_g4_main_agent_transfers_are_not_delayed_by_a_hung_head(g4env, tmp_path):
-    w = new_world(g4env, tmp_path, flavor="object", slots=2)
-    w.storage.query_gate = threading.Event()
+@pytest.mark.parametrize("flavor", FLAVORS)
+def test_g4_main_agent_transfers_are_not_delayed_by_a_hung_head(
+    g4env, tmp_path, flavor
+):
+    w = new_world(g4env, tmp_path, flavor=flavor, slots=2)
+    w.hold_checks()
     assert w.kvcr.query([A], "r") == [fetching_g4()]
-    wait_for(lambda: w.storage.query_blocked == 1)
+    wait_for(lambda: w.blocked_checks() == 1)
     transfers = len(w.main.transfers)
     assert w.deposit(B, 1).success
     assert len(w.main.transfers) > transfers
     assert w.kvcr.query([B]) == [(QueryStatus.HIT, CacheTier.LOCAL_G2)]
 
 
-def test_g4_obj_checks_and_probes_run_on_their_own_agent_and_thread(g4env, tmp_path):
-    w = new_world(g4env, tmp_path, flavor="object")
+@pytest.mark.parametrize("flavor", FLAVORS)
+def test_g4_checks_probes_and_transfers_share_the_one_storage_agent(
+    g4env, tmp_path, flavor
+):
+    w = new_world(g4env, tmp_path, flavor=flavor)
     w.spill(A, 0)
-    started = len(w.storage.calls)
     _present(w)
     w.storage.outcome["READ"] = "ERR"
     assert not w.wait(w.deliver(A, 4))[A].success
-    # The check and the read-error probe both ask the check agent.
+    names = [name for name, _ in w.storage.calls]
+    assert "query_memory" in names
+    assert "initialize_xfer" in names
+    assert w.storage.check_peer is None
+    assert w.check_agent is w.storage
+
+
+@pytest.mark.parametrize("flavor", FLAVORS)
+def test_g4_every_storage_call_runs_on_one_thread(g4env, tmp_path, flavor):
+    w = new_world(g4env, tmp_path, flavor=flavor)
+    w.spill(A, 0)
+    _present(w)
+    w.storage.outcome["READ"] = "ERR"
+    assert not w.wait(w.deliver(A, 4))[A].success
+    assert w.kvcr.query([B], "b") == [fetching_g4()]
     wait_for(lambda: len(w.check_names()) >= 2)
-    storage_calls = [name for name, _ in w.storage.calls[started:]]
-    assert "query_memory" not in storage_calls
-    check_threads = {ident for _, ident in w.check_agent.calls}
-    assert len(check_threads) == 1
-    assert check_threads.isdisjoint(w.storage.threads())
-    assert threading.get_ident() not in check_threads
-    assert check_threads.isdisjoint(w.main.threads())
+    threads = w.storage.threads()
+    assert len(threads) == 1
+    assert threading.get_ident() not in threads
+    assert threads.isdisjoint(w.main.threads())
 
 
-def test_g4_file_checks_run_on_their_own_agent_and_thread(g4env, tmp_path):
-    w = new_world(g4env, tmp_path, flavor="file")
-    w.spill(A, 0)
-    started = len(w.storage.calls)
-    _present(w)
-    assert w.wait(w.deliver(A, 4))[A].success
-    storage_calls = [name for name, _ in w.storage.calls[started:]]
-    assert "query_memory" not in storage_calls
-    check_threads = {ident for _, ident in w.check_agent.calls}
-    assert len(check_threads) == 1
-    assert check_threads.isdisjoint(w.storage.threads())
-    assert threading.get_ident() not in check_threads
-    assert check_threads.isdisjoint(w.main.threads())
-
-
-def test_g4_file_check_agent_is_not_the_transfer_agent(g4env, tmp_path):
+def test_g4_file_syscalls_run_on_the_storage_thread(g4env, tmp_path):
     w = new_world(g4env, tmp_path, flavor="file")
     w.spill(A, 0)
     _present(w)
-    assert w.check_agent is not w.storage
-    assert w.check_agent.name != w.storage.name
+    w.storage.outcome["READ"] = "ERR"
+    assert not w.wait(w.deliver(A, 4))[A].success
+    wait_for(lambda: len(w.stat_log) > 0)
+    assert w.stat_threads == w.storage.threads()
 
 
 def test_g4_file_checks_ask_the_nixl_file_query_for_the_final_path(g4env, tmp_path):
@@ -557,37 +561,73 @@ def test_g4_file_check_of_a_missing_file_is_a_miss_from_a_none_answer(g4env, tmp
     assert w.storage.log("READ") == []
 
 
-def test_g4_obj_transfer_is_not_delayed_by_a_check_blocked_in_storage(g4env, tmp_path):
-    w = new_world(g4env, tmp_path, flavor="object", failure_threshold=1)
+@pytest.mark.parametrize("mode", [stat.S_IFDIR | 0o755, stat.S_IFIFO | 0o644])
+def test_g4_file_check_of_a_non_regular_file_is_a_miss(g4env, tmp_path, mode):
+    w = new_world(g4env, tmp_path, flavor="file")
+    w.spill(A, 0)
+    w.storage.file_mode = mode
+    assert w.await_check(A) == (QueryStatus.MISS, None)
+    assert w.check_names() == [digest(A)]
+    assert w.storage.log("READ") == []
+
+
+def test_g4_file_check_of_a_regular_file_with_permission_bits_is_fetchable(
+    g4env, tmp_path
+):
+    w = new_world(g4env, tmp_path, flavor="file")
+    w.spill(A, 0)
+    w.storage.file_mode = stat.S_IFREG | 0o600
+    assert w.await_check(A) == fetchable_g4()
+
+
+@pytest.mark.parametrize("flavor", FLAVORS)
+def test_g4_blocked_check_pauses_a_transfer_until_the_query_returns(
+    g4env, tmp_path, flavor
+):
+    w = new_world(
+        g4env, tmp_path, flavor=flavor, failure_threshold=2, check_timeout_ms=500
+    )
     w.spill(A, 0)
     _present(w)
-    w.hold_checks()
+    gate = w.hold_checks()
     assert w.kvcr.query([B], "b") == [fetching_g4()]
     wait_for(lambda: w.blocked_checks() == 1)
     w.storage.outcome["READ"] = "HOLD"
-    try:
-        handle = w.deliver(A, 4)
-        wait_for(lambda: len(w.storage.held("READ")) == 1, timeout=1.0)
-        w.advance(0.9)
-        w.storage.finish_all("DONE")
-        # Reported before its deadline, with no latch and no breaker count.
-        assert w.wait(handle, timeout=1.0)[A].success
-        assert not w.breaker_open()
-    finally:
-        w.storage.outcome["READ"] = "DONE"
+    handle = w.deliver(A, 4)
+    w.settle(20)
+    # One thread serves queries and transfers: the read waits behind the query.
+    assert w.storage.held("READ") == []
+    w.advance(0.7)
+    # The check still resolves at its deadline and counts once.
+    assert w.kvcr.query([B], "b") == [(QueryStatus.MISS, None)]
+    assert w.g4_state()["g4_breaker_failures"] == 1
+    assert not w.breaker_open()
+    gate.set()
+    wait_for(lambda: len(w.storage.held("READ")) == 1)
+    w.storage.finish_all("DONE")
+    assert w.wait(handle)[A].success
+    assert w.g4_state()["g4_breaker_failures"] == 1
 
 
-def test_g4_obj_transfer_is_not_delayed_by_a_probe_blocked_in_storage(g4env, tmp_path):
-    w = new_world(g4env, tmp_path, flavor="object", failure_threshold=1)
+@pytest.mark.parametrize("flavor", FLAVORS)
+def test_g4_blocked_probe_pauses_the_next_transfer_until_it_returns(
+    g4env, tmp_path, flavor
+):
+    w = new_world(g4env, tmp_path, flavor=flavor, failure_threshold=3)
     w.spill(A, 0)
     w.spill(B, 1)
     _present(w, A, "ra")
     _present(w, B, "rb")
     w.storage.sequence["READ"] = ["ERR", "DONE"]
-    w.hold_checks()
+    gate = w.hold_probes()
     assert not w.wait(w.deliver(A, 4, "ra"))[A].success
     wait_for(lambda: w.blocked_checks() == 1)
-    assert w.wait(w.deliver(B, 5, "rb"), timeout=1.0)[B].success
+    handle = w.deliver(B, 5, "rb")
+    w.settle(20)
+    assert len(w.storage.log("READ")) == 1
+    gate.set()
+    assert w.wait(handle)[B].success
+    assert len(w.storage.log("READ")) == 2
     assert not w.breaker_open()
 
 
@@ -603,14 +643,17 @@ def test_g4_deliver_read_error_is_failed(g4env, tmp_path, flavor):
     assert not w.wait(w.deliver(A, 4))[A].success
 
 
-def test_g4_read_error_completes_before_the_classification_probe(g4env, tmp_path):
-    w = new_world(g4env, tmp_path, flavor="object")
+@pytest.mark.parametrize("flavor", FLAVORS)
+def test_g4_read_error_completes_before_the_classification_probe(
+    g4env, tmp_path, flavor
+):
+    w = new_world(g4env, tmp_path, flavor=flavor)
     w.spill(A, 0)
     _present(w)
     w.storage.outcome["READ"] = "ERR"
-    w.storage.query_gate = threading.Event()
+    gate = w.hold_probes()
     assert not w.wait(w.deliver(A, 4))[A].success
-    w.storage.query_gate.set()
+    gate.set()
 
 
 @pytest.mark.parametrize("flavor", FLAVORS)

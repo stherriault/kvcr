@@ -165,12 +165,13 @@ class _Registration:
 class FakeG4Agent:
     """Storage-side NIXL agent for the OBJ and POSIX plugins.
 
-    The agent named ``<agent>-g4`` carries transfers. A second agent created
-    for the check worker is a peer: it records its own calls and threads but
-    answers query_memory from the first agent's store and knobs, so one set of
-    knobs steers every existence check. An OBJ query answers from the object
-    store; a FILE query answers like the POSIX file query, from the real files
-    under the path: a dict of string size, mode and mtime, or None if missing.
+    The agent named ``<agent>-g4`` carries transfers and answers existence
+    checks. Should the code under test create a second agent for checks, it
+    is a peer that answers from the first agent's store and knobs, and
+    ``check_peer`` shows it; the tests expect there is none. An OBJ query
+    answers from the object store; a FILE query answers like the POSIX file
+    query, from the real files under the path: a dict of string size, mode
+    and mtime, or None if missing.
     """
 
     def __init__(
@@ -200,6 +201,8 @@ class FakeG4Agent:
         self.query_calls: list[tuple[str, ...]] = []
         self.query_rows: list[tuple[tuple[Any, ...], ...]] = []
         self.query_types: list[tuple[str | None, str]] = []
+        # A FILE query reports this st_mode instead of the file's own.
+        self.file_mode: int | None = None
         self.query_blocked = 0
         self.query_gate: threading.Event | None = None
         self.query_error: Exception | None = None
@@ -301,15 +304,15 @@ class FakeG4Agent:
             self.query_rows.clear()
             self.query_types.clear()
 
-    @staticmethod
-    def _file_answer(path):
+    def _file_answer(self, path):
         try:
             info = os.lstat(path)
         except FileNotFoundError:
             return None
+        mode = info.st_mode if self.file_mode is None else self.file_mode
         return {
             "size": str(info.st_size),
-            "mode": str(info.st_mode),
+            "mode": str(mode),
             "mtime": str(int(info.st_mtime)),
         }
 
@@ -812,6 +815,15 @@ class World:
         gate = threading.Event()
         self.env.gates.append(gate)
         self.storage.query_gate = gate
+        return gate
+
+    def hold_probes(self) -> threading.Event:
+        """Block every read-error re-check: os.stat on file, a query on OBJ."""
+        if self.flavor == "object":
+            return self.hold_checks()
+        gate = threading.Event()
+        self.env.gates.append(gate)
+        self.stat_gate = gate
         return gate
 
     def blocked_checks(self) -> int:

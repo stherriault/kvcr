@@ -6,11 +6,11 @@ KVCR keeps no G4 index. ``query`` starts an existence check, ``fetch`` and
 ``deliver`` read one object per key straight into the destination, and a
 LOCAL_G2 eviction writes the victim and publishes it atomically.
 
-Threads: transfers run on the G4 storage worker, which owns the storage
-agent. Existence checks, and object flavor read-error probes, run on the G4
-check worker, which owns a second storage agent, so a slow check never delays
-a transfer. Every other file system call runs on the G4 file worker. Core state
-changes only on caller threads under ``_state_lock``; workers report through
+Threads: the G4 storage worker owns the one storage agent and makes every
+storage call: transfers, existence checks, read-error probes and, for the
+file flavor, every file system call. A slow call pauses the others; check
+deadlines and the breaker bound what callers wait for. Core state changes
+only on caller threads under ``_state_lock``; the worker reports through
 completion queues that ``poll_completed`` (and ``query``, for checks) drain.
 
 Lifetime rule: destinations, sources, registrations and fds are released only
@@ -72,12 +72,8 @@ _OBJ_DEVID_BASE = 1 << 32
 _IDLE_WAIT_SECONDS = 0.0005
 _WAKE_SECONDS = 0.05
 _COUNTED_BATCHES = 1024
-# NIXL 1.5.0 OBJ query_memory waits up to 30 s per HEAD, one after another.
-_QUERY_SECONDS_PER_ROW = 30.0
-_QUERY_MARGIN_SECONDS = 5.0
 # Last join before close reports a worker as stuck; covers its exit path.
 _FINAL_JOIN_SECONDS = 0.1
-_STOP = object()
 _FETCHING = (QueryStatus.FETCHING, CacheTier.G4)
 _FETCHABLE = (QueryStatus.FETCHABLE, CacheTier.G4)
 _MISS = (QueryStatus.MISS, None)
@@ -86,7 +82,7 @@ _FALSE_VALUES = ("", "0", "false", "no", "off")
 
 @dataclass(eq=False)
 class _CheckJob:
-    """One existence check (or a post-ERR probe) for the workers."""
+    """One existence check (or a post-ERR probe) for the storage worker."""
 
     key: BlockKey
     name: str
@@ -125,8 +121,7 @@ class _Xfer:
     file_id: tuple[int, int] | None = None
     reg: Any = None
     handle: Any = None
-    # Set by the storage worker: taken for posting, and handle released.
-    posting: bool = False
+    # Set by the storage worker once the handle is released.
     released: bool = False
     start_failed: bool = False
     outcome: Literal["", "DONE", "ERR", "ABSENT", "PUBLISH_ERR"] = ""
@@ -303,7 +298,12 @@ def _create_agent(g4: "_G4", name: str) -> Any:
 
 
 class _StorageWorker:
-    """Owns the storage NIXL agent and runs every transfer on it."""
+    """Owns the storage NIXL agent and runs every G4 storage call in turn.
+
+    Transfers, existence checks, read-error probes and every file system call
+    of the file flavor run here, so a slow call pauses the others until it
+    returns.
+    """
 
     label = "storage"
 
@@ -320,13 +320,14 @@ class _StorageWorker:
         self.agent_name = f"{g4._kvcr.nixl_agent_name}-g4"
         self._dram_regs: list[Any] = []
         self._next_devid = _OBJ_DEVID_BASE
+        self._next_batch = 0
         self.thread = threading.Thread(
             target=self._run, daemon=True, name="kvcr-g4-storage"
         )
 
-    def submit(self, job: object) -> None:
+    def submit(self, jobs: Collection[object]) -> None:
         with self.cond:
-            self.jobs.append(job)
+            self.jobs.extend(jobs)
             self.cond.notify()
 
     def stop(self) -> None:
@@ -347,6 +348,27 @@ class _StorageWorker:
                     backends=[backend],
                 )
             )
+        if g4._flavor == "object":
+            self._check_bucket()
+
+    def _check_bucket(self) -> None:
+        # One HEAD at startup turns a wrong bucket, endpoint or credential
+        # into a start error; absent and present both prove access.
+        g4 = self._g4
+        name = f"{g4._prefix}/{g4._layout_tag}/.startup-check"
+        try:
+            answers = list(
+                self.agent.query_memory(
+                    [(0, g4._payload_len, 0, name)], g4._backend, mem_type="OBJ"
+                )
+            )
+            if len(answers) != 1:
+                raise RuntimeError("query_memory answered the wrong number of rows")
+        except Exception as error:
+            bucket = g4._backend_params.get("bucket")
+            raise RuntimeError(
+                f"G4 cannot check objects in bucket {bucket!r}: {error}"
+            ) from error
 
     def _run(self) -> None:
         try:
@@ -357,25 +379,36 @@ class _StorageWorker:
             self.ready.set()
             return
         self.ready.set()
+        g4 = self._g4
         active: list[_Xfer] = []
+        checks: deque[_CheckJob] = deque()
+        probes: deque[_CheckJob] = deque()
         close_deadline: float | None = None
         try:
             while True:
                 with self.cond:
-                    if not (self.jobs or active or self.stopping):
+                    if not (self.jobs or active or checks or probes or self.stopping):
                         self.cond.wait(_WAKE_SECONDS)
                     jobs = list(self.jobs)
                     self.jobs.clear()
                     stopping = self.stopping
                 if stopping:
-                    # Close drops every transfer that has not started.
+                    # Close drops every job that has not started.
+                    for job in (*jobs, *checks, *probes):
+                        if isinstance(job, _CheckJob):
+                            g4._try_cancel(job)
                     jobs = []
+                    checks.clear()
+                    probes.clear()
                     if close_deadline is None:
                         close_deadline = (
                             time.monotonic() + _progress._OP_CLEANUP_TIMEOUT_SECONDS
                         )
                 for job in jobs:
-                    self._start(job, active)
+                    if isinstance(job, _CheckJob):
+                        (probes if job.probe_op is not None else checks).append(job)
+                    else:
+                        self._start(job, active)
                 worked = self._poll(active)
                 if stopping:
                     if not active:
@@ -384,7 +417,11 @@ class _StorageWorker:
                         raise RuntimeError("G4 storage transfers did not finish")
                     time.sleep(_IDLE_WAIT_SECONDS)
                     continue
-                if active and not worked:
+                if probes:
+                    self._probe(probes.popleft())
+                elif checks:
+                    self._check_batch(checks)
+                elif active and not worked:
                     time.sleep(_IDLE_WAIT_SECONDS)
         except BaseException as error:
             self.failure = error
@@ -401,13 +438,18 @@ class _StorageWorker:
         for reg in reversed(regs):
             agent.deregister_memory(reg, backends=[self._g4._backend])
 
+    # Transfers.
+
     def _start(self, xfer: _Xfer, active: list[_Xfer]) -> None:
         g4 = self._g4
-        with g4._job_lock:
-            if g4._dead:
-                # Its op already failed; nothing may touch its memory now.
+        if g4._flavor == "file":
+            try:
+                if not self._open(xfer):
+                    return
+            except Exception as error:
+                logger.exception("KVCR G4 block file job failed")
+                self._fail(xfer, error)
                 return
-            xfer.posting = True
         agent = self.agent
         backend = g4._backend
         try:
@@ -442,7 +484,7 @@ class _StorageWorker:
             xfer.released = True
             xfer.start_failed = True
             xfer.outcome = "ERR"
-            g4._after_storage(xfer)
+            self._ended(xfer)
             return
         self.unreleased.add(xfer)
         active.append(xfer)
@@ -484,239 +526,25 @@ class _StorageWorker:
             xfer.released = True
             self._deregister(xfer)
             xfer.outcome = "DONE" if state == "DONE" else "ERR"
-            self._g4._after_storage(xfer)
+            self._ended(xfer)
             worked = True
         return worked
 
-
-class _CheckWorker:
-    """Owns the check agent; runs existence checks and object flavor probes."""
-
-    label = "check storage"
-
-    def __init__(self, g4: "_G4") -> None:
-        self._g4 = g4
-        self.cond = threading.Condition()
-        self.jobs: deque[_CheckJob] = deque()
-        self.stopping = False
-        self.ready = threading.Event()
-        self.error: BaseException | None = None
-        self.failure: BaseException | None = None
-        self.agent: Any = None
-        self.agent_name = f"{g4._kvcr.nixl_agent_name}-g4-check"
-        self._next_batch = 0
-        self.blocked_until: float | None = None
-        self.thread = threading.Thread(
-            target=self._run, daemon=True, name="kvcr-g4-check"
-        )
-
-    def submit(self, jobs: Collection[_CheckJob]) -> None:
-        with self.cond:
-            self.jobs.extend(jobs)
-            self.cond.notify()
-
-    def stop(self) -> None:
-        with self.cond:
-            self.stopping = True
-            self.cond.notify()
-
-    def _setup(self) -> None:
-        g4 = self._g4
-        self.agent = _create_agent(g4, self.agent_name)
-        if g4._flavor == "object":
-            self._check_bucket()
-
-    def _check_bucket(self) -> None:
-        g4 = self._g4
-        # One HEAD at startup turns a wrong bucket, endpoint or credential
-        # into a start error; absent and present both prove access.
-        name = f"{g4._prefix}/{g4._layout_tag}/.startup-check"
+    def _ended(self, xfer: _Xfer) -> None:
+        """The handle is released or never existed; close the file side."""
+        if self._g4._flavor != "file":
+            self._g4._op_done.put(xfer)
+            return
         try:
-            answers = list(
-                self.agent.query_memory(
-                    [(0, g4._payload_len, 0, name)], g4._backend, mem_type="OBJ"
-                )
-            )
-            if len(answers) != 1:
-                raise RuntimeError("query_memory answered the wrong number of rows")
+            self._finish(xfer)
         except Exception as error:
-            bucket = g4._backend_params.get("bucket")
-            raise RuntimeError(
-                f"G4 cannot check objects in bucket {bucket!r}: {error}"
-            ) from error
+            logger.exception("KVCR G4 block file job failed")
+            self._fail(xfer, error)
 
-    def _run(self) -> None:
-        try:
-            self._setup()
-        except BaseException as error:
-            self.error = error
-            self.ready.set()
-            return
-        self.ready.set()
-        checks: deque[_CheckJob] = deque()
-        probes: deque[_CheckJob] = deque()
-        try:
-            while True:
-                with self.cond:
-                    if not (self.jobs or checks or probes or self.stopping):
-                        self.cond.wait(_WAKE_SECONDS)
-                    jobs = list(self.jobs)
-                    self.jobs.clear()
-                    stopping = self.stopping
-                if stopping:
-                    # Close drops every check that has not started.
-                    for job in (*jobs, *checks, *probes):
-                        self._g4._try_cancel(job)
-                    return
-                for job in jobs:
-                    (probes if job.probe_op is not None else checks).append(job)
-                if probes:
-                    job = probes.popleft()
-                    if self._g4._try_start(job):
-                        self._query((job,))
-                elif checks:
-                    self._check_batch(checks)
-        except BaseException as error:
-            self.failure = error
+    # File system calls of the file flavor.
 
-    def _check_batch(self, checks: deque[_CheckJob]) -> None:
-        batch: list[_CheckJob] = []
-        while checks and len(batch) < self._g4._options.check_batch_max:
-            job = checks.popleft()
-            if self._g4._try_start(job):
-                batch.append(job)
-        if batch:
-            self._query(batch)
-
-    def _query(self, jobs: Collection[_CheckJob]) -> None:
-        g4 = self._g4
-        self._next_batch += 1
-        for job in jobs:
-            job.batch = self._next_batch
-        if g4._flavor == "file":
-            kind = "FILE"
-            rows = [(0, 0, 0, job.name) for job in jobs]
-        else:
-            kind = "OBJ"
-            rows = [(0, g4._payload_len, 0, job.name) for job in jobs]
-        self.blocked_until = (
-            time.monotonic()
-            + len(rows) * _QUERY_SECONDS_PER_ROW
-            + _QUERY_MARGIN_SECONDS
-        )
-        try:
-            answers = list(self.agent.query_memory(rows, g4._backend, mem_type=kind))
-            if len(answers) != len(rows):
-                raise RuntimeError("query_memory answered the wrong number of rows")
-            results = [
-                "present" if self._present(answer) else "absent" for answer in answers
-            ]
-            error = ""
-        except Exception as caught:
-            logger.debug("KVCR G4 existence check failed", exc_info=True)
-            results = ["error"] * len(rows)
-            error = str(caught)
-        finally:
-            self.blocked_until = None
-        for job, result in zip(jobs, results, strict=True):
-            job.result = result
-            job.error = error
-            g4._check_done.put(job)
-
-    def _present(self, answer: Any) -> bool:
-        if answer is None:
-            return False
-        if self._g4._flavor == "object":
-            return True
-        # The POSIX query answers stat fields as decimal strings.
-        try:
-            size = int(answer["size"])
-            mode = int(answer["mode"])
-        except (KeyError, TypeError, ValueError):
-            return False
-        return size == self._g4._payload_len and stat.S_ISREG(mode)
-
-
-class _FileWorker:
-    """Runs the file flavor's file system calls and read re-checks, in queue order."""
-
-    def __init__(self, g4: "_G4") -> None:
-        self._g4 = g4
-        self.queue: queue.SimpleQueue[object] = queue.SimpleQueue()
-        self.stopping = False
-        self.failure: BaseException | None = None
-        self.thread = threading.Thread(
-            target=self._run, daemon=True, name="kvcr-g4-file"
-        )
-
-    def stop(self) -> None:
-        self.stopping = True
-        self.queue.put(_STOP)
-
-    label = "file"
-
-    def _run(self) -> None:
-        try:
-            while True:
-                job = self.queue.get()
-                # Close drops every job still queued.
-                if job is _STOP or self.stopping:
-                    return
-                try:
-                    self._do(job)
-                except Exception as error:
-                    logger.exception("KVCR G4 file worker job failed")
-                    self._fail(job, error)
-        except BaseException as error:
-            self.failure = error
-
-    def _do(self, job: object) -> None:
-        if isinstance(job, _CheckJob):
-            if self._g4._try_start(job):
-                self._check(job)
-        elif job.handle is None and not job.start_failed:
-            self._open(job)
-        else:
-            self._finish(job)
-
-    def _fail(self, job: object, error: Exception) -> None:
-        """End a job that raised, so its operation still completes."""
-        g4 = self._g4
-        if isinstance(job, _CheckJob):
-            if job.started:
-                job.result = "error"
-                job.error = str(error)
-                g4._check_done.put(job)
-            return
-        xfer = job
-        with contextlib.suppress(OSError):
-            self._close_fd(xfer)
-        if xfer.tmp is not None and not xfer.published:
-            with contextlib.suppress(OSError):
-                os.unlink(xfer.tmp)
-        if xfer.handle is None:
-            xfer.start_failed = True
-            xfer.outcome = "ERR"
-        elif xfer.op.kind == "spill" and not xfer.published:
-            xfer.outcome = "PUBLISH_ERR" if xfer.outcome == "DONE" else "ERR"
-        xfer.error = str(error)
-        g4._op_done.put(xfer)
-
-    def _check(self, job: _CheckJob) -> None:
-        """Answer whether the file a read used is still the one in place."""
-        try:
-            info = os.stat(job.name)
-        except FileNotFoundError:
-            job.result = "absent"
-        except OSError as error:
-            job.result = "error"
-            job.error = str(error)
-        else:
-            same = (info.st_dev, info.st_ino) == job.file_id
-            job.result = "present" if same else "absent"
-        self._g4._check_done.put(job)
-
-    def _open(self, xfer: _Xfer) -> None:
+    def _open(self, xfer: _Xfer) -> bool:
+        """Open the block file; False when the transfer already ended."""
         g4 = self._g4
         direct = os.O_DIRECT if g4._options.direct_io else 0
         if xfer.op.kind == "spill":
@@ -733,33 +561,32 @@ class _FileWorker:
                 xfer.start_failed = True
                 xfer.outcome = "ERR"
                 self._finish(xfer)
-                return
-            g4._storage.submit(xfer)
-            return
+                return False
+            return True
         try:
             fd = os.open(xfer.name, os.O_RDONLY | os.O_CLOEXEC | direct)
         except FileNotFoundError:
             xfer.outcome = "ABSENT"
             g4._op_done.put(xfer)
-            return
+            return False
         except OSError:
             logger.warning("KVCR G4 block file could not open", exc_info=True)
             xfer.outcome = "ERR"
             g4._op_done.put(xfer)
-            return
+            return False
         xfer.fd = fd
         try:
             info = os.fstat(fd)
         except OSError:
             xfer.outcome = "ERR"
             self._finish(xfer)
-            return
+            return False
         xfer.file_id = (info.st_dev, info.st_ino)
         if info.st_size != g4._payload_len:
             xfer.outcome = "ABSENT"
             self._finish(xfer)
-            return
-        g4._storage.submit(xfer)
+            return False
+        return True
 
     def _close_fd(self, xfer: _Xfer) -> None:
         if xfer.fd is not None and not xfer.fd_closed:
@@ -788,6 +615,100 @@ class _FileWorker:
             except OSError:
                 logger.warning("KVCR G4 block file close failed", exc_info=True)
         self._g4._op_done.put(xfer)
+
+    def _fail(self, xfer: _Xfer, error: Exception) -> None:
+        """End a transfer whose file call raised, so its operation still completes."""
+        with contextlib.suppress(OSError):
+            self._close_fd(xfer)
+        if xfer.tmp is not None and not xfer.published:
+            with contextlib.suppress(OSError):
+                os.unlink(xfer.tmp)
+        if xfer.handle is None:
+            xfer.start_failed = True
+            xfer.outcome = "ERR"
+        elif xfer.op.kind == "spill" and not xfer.published:
+            xfer.outcome = "PUBLISH_ERR" if xfer.outcome == "DONE" else "ERR"
+        xfer.error = str(error)
+        self._g4._op_done.put(xfer)
+
+    # Existence checks and read-error probes.
+
+    def _check_batch(self, checks: deque[_CheckJob]) -> None:
+        batch: list[_CheckJob] = []
+        while checks and len(batch) < self._g4._options.check_batch_max:
+            job = checks.popleft()
+            if self._g4._try_start(job):
+                batch.append(job)
+        if batch:
+            self._query(batch)
+
+    def _probe(self, job: _CheckJob) -> None:
+        if not self._g4._try_start(job):
+            return
+        if job.file_id is None:
+            self._query((job,))
+            return
+        try:
+            self._restat(job)
+        except Exception as error:
+            logger.exception("KVCR G4 block file re-check failed")
+            job.result = "error"
+            job.error = str(error)
+        self._g4._check_done.put(job)
+
+    def _restat(self, job: _CheckJob) -> None:
+        """Answer whether the file a read used is still the one in place."""
+        try:
+            info = os.stat(job.name)
+        except FileNotFoundError:
+            job.result = "absent"
+        except OSError as error:
+            job.result = "error"
+            job.error = str(error)
+        else:
+            same = (info.st_dev, info.st_ino) == job.file_id
+            job.result = "present" if same else "absent"
+
+    def _query(self, jobs: Collection[_CheckJob]) -> None:
+        g4 = self._g4
+        self._next_batch += 1
+        for job in jobs:
+            job.batch = self._next_batch
+        if g4._flavor == "file":
+            kind = "FILE"
+            rows = [(0, 0, 0, job.name) for job in jobs]
+        else:
+            kind = "OBJ"
+            rows = [(0, g4._payload_len, 0, job.name) for job in jobs]
+        try:
+            answers = list(self.agent.query_memory(rows, g4._backend, mem_type=kind))
+            if len(answers) != len(rows):
+                raise RuntimeError("query_memory answered the wrong number of rows")
+            results = [
+                "present" if self._present(answer) else "absent" for answer in answers
+            ]
+            error = ""
+        except Exception as caught:
+            logger.debug("KVCR G4 existence check failed", exc_info=True)
+            results = ["error"] * len(rows)
+            error = str(caught)
+        for job, result in zip(jobs, results, strict=True):
+            job.result = result
+            job.error = error
+            g4._check_done.put(job)
+
+    def _present(self, answer: Any) -> bool:
+        if answer is None:
+            return False
+        if self._g4._flavor == "object":
+            return True
+        # The POSIX query answers stat fields as decimal strings.
+        try:
+            size = int(answer["size"])
+            mode = int(answer["mode"])
+        except (KeyError, TypeError, ValueError):
+            return False
+        return size == self._g4._payload_len and stat.S_ISREG(mode)
 
 
 class _G4:
@@ -898,9 +819,8 @@ class _G4:
         self._ops: dict[_OpId, _G4Op] = {}
         self._pending_spills: set[BlockKey] = set()
         self._closing = False
-        # Off: G4 takes no new work. Dead: a storage-side worker died.
+        # Set when the storage worker dies: G4 takes no new work.
         self._off = False
-        self._dead = False
         self.spill_late = 0
         self.spill_dropped = 0
         self._counters = dict.fromkeys(
@@ -917,8 +837,6 @@ class _G4:
             0,
         )
         self._storage = _StorageWorker(self)
-        self._checker = _CheckWorker(self)
-        self._file = _FileWorker(self) if self._flavor == "file" else None
 
     # Startup and naming.
 
@@ -1003,21 +921,13 @@ class _G4:
                     f"not a multiple of {page}; align it or set direct_io=False"
                 )
 
-    def _agent_workers(self) -> list["_StorageWorker | _CheckWorker"]:
-        return [self._storage, self._checker]
-
     def start(self, timeout: float) -> None:
-        for worker in (*self._agent_workers(), self._file):
-            if worker is not None:
-                worker.thread.start()
-        deadline = time.monotonic() + timeout
-        for worker in self._agent_workers():
-            if not worker.ready.wait(max(0.0, deadline - time.monotonic())):
-                raise RuntimeError(
-                    f"G4 {worker.label} worker did not start within {timeout:g}s"
-                )
-            if worker.error is not None:
-                raise worker.error
+        worker = self._storage
+        worker.thread.start()
+        if not worker.ready.wait(timeout):
+            raise RuntimeError(f"G4 storage worker did not start within {timeout:g}s")
+        if worker.error is not None:
+            raise worker.error
 
     # Worker hand-offs.
 
@@ -1036,18 +946,9 @@ class _G4:
             job.cancelled = True
             return True
 
-    def _after_storage(self, xfer: _Xfer) -> None:
-        if self._flavor == "file":
-            self._file.queue.put(xfer)
-        else:
-            self._op_done.put(xfer)
-
     def _launch(self, xfer: _Xfer) -> None:
         xfer.started_at = self._kvcr._timer()
-        if self._flavor == "file":
-            self._file.queue.put(xfer)
-        else:
-            self._storage.submit(xfer)
+        self._storage.submit((xfer,))
 
     # Existence checks.
 
@@ -1180,7 +1081,7 @@ class _G4:
         if not jobs:
             return
         # One hand-off, so the worker batches them into full calls.
-        self._checker.submit(jobs)
+        self._storage.submit(jobs)
 
     def lookup(
         self, key: BlockKey, owner: str | None
@@ -1431,16 +1332,11 @@ class _G4:
     # Completion pump.
 
     def poll_main(self) -> None:
-        if self._dead:
+        if self._off:
             return
-        if not self._closing:
-            for worker in (self._storage, self._file):
-                if worker is not None and worker.failure is not None:
-                    self._disable(worker)
-                    return
-            checker = self._checker
-            if checker is not None and checker.failure is not None and not self._off:
-                self._stop_checks(checker)
+        if not self._closing and self._storage.failure is not None:
+            self._disable()
+            return
         self.refresh()
         while True:
             try:
@@ -1478,47 +1374,20 @@ class _G4:
         self._owner_keys.clear()
         self._inflight = self._pending_count = self._sub_count = 0
 
-    def _stop_checks(self, worker: "_CheckWorker") -> None:
-        """The check worker died: no new G4 work; started transfers finish."""
-        self._off = True
-        logger.warning(
-            "KVCR G4 takes no new work until restart: its %s worker failed: %r",
-            worker.label,
-            worker.failure,
-        )
-        self._clear_checks()
-        # Probes will never answer; their reads count as plain failures.
-        for job in tuple(self._probes):
-            self._probes.discard(job)
-            op = job.probe_op
-            op.probes -= 1
-            self._count_failure(op, "read failed and its probe was lost")
-            self._end_op_if_done(op)
-
-    def _disable(self, worker: "_StorageWorker | _FileWorker") -> None:
-        """A transfer-side worker died: fail every open G4 op, turn G4 off.
+    def _disable(self) -> None:
+        """The storage worker died: fail every open G4 op, turn G4 off.
 
         Memory a posted, unreleased handle may still touch stays pinned until
         close; memory of transfers never posted is freed.
         """
-        with self._job_lock:
-            self._dead = self._off = True
-        logger.warning(
-            "KVCR G4 is off until restart: its %s worker failed: %r",
-            worker.label,
-            worker.failure,
-        )
+        self._off = True
         storage = self._storage
-        if storage.thread.is_alive():
-            # It may still post what it took; count those as posted.
-            def pinned(xfer: _Xfer) -> bool:
-                return xfer.posting and not xfer.released
-        else:
-            unreleased = set(storage.unreleased)
-
-            def pinned(xfer: _Xfer) -> bool:
-                return xfer in unreleased
-
+        logger.warning(
+            "KVCR G4 is off until restart: its storage worker failed: %r",
+            storage.failure,
+        )
+        # The worker stops changing this set once it records its failure.
+        unreleased = set(storage.unreleased)
         local = self._kvcr._local_dram
         for op in tuple(self._ops.values()):
             self._ops.pop(op.op_id)
@@ -1529,7 +1398,7 @@ class _G4:
             open_xfers = [xfer for xfer in op.xfers if not xfer.finished]
             for xfer in open_xfers:
                 self._record(xfer, False)
-            held = [xfer for xfer in open_xfers if pinned(xfer)]
+            held = [xfer for xfer in open_xfers if xfer in unreleased]
             for xfer in op.xfers:
                 if xfer not in held:
                     xfer.finished = True
@@ -1538,7 +1407,7 @@ class _G4:
                     # Source claim, capacity reservation and dependencies stay.
                     continue
                 self._pending_spills.difference_update(op.keys)
-                reason = f"{worker.label} worker failed"
+                reason = "storage worker failed"
                 for key in op.keys:
                     self._recover_spill_failure(op, key, reason)
                 self._kvcr._remove_block_dependencies(op)
@@ -1592,18 +1461,13 @@ class _G4:
                 and not self._off
                 and self._breaker.state() == "closed"
             )
-            if probe and self._flavor == "object":
-                # A probe decides whether the block vanished or storage failed.
-                job = _CheckJob(xfer.key, xfer.name, probe_op=op)
-                op.probes += 1
-                self._probes.add(job)
-                self._checker.submit((job,))
-            elif probe and xfer.file_id is not None:
-                # A re-stat decides whether the file was removed or replaced.
+            if probe and (self._flavor == "object" or xfer.file_id is not None):
+                # A probe decides whether the block vanished or storage failed:
+                # a query on OBJ, a re-stat of the file the read used on files.
                 job = _CheckJob(xfer.key, xfer.name, probe_op=op, file_id=xfer.file_id)
                 op.probes += 1
                 self._probes.add(job)
-                self._file.queue.put(job)
+                self._storage.submit((job,))
             else:
                 self._count_failure(op, xfer.error or "read failed")
         self._end_op_if_done(op)
@@ -1717,62 +1581,29 @@ class _G4:
     # Close.
 
     def close_workers(self) -> None:
-        """Drop unstarted jobs, let started transfers end, and join every worker."""
+        """Drop unstarted jobs, let started transfers end, and join the worker."""
         self._closing = True
-        workers = [*self._agent_workers(), self._file]
-        for worker in workers:
-            if worker is not None:
-                worker.stop()
-        timeout = _progress._OP_CLEANUP_TIMEOUT_SECONDS
-        # close_timeout_ms bounds all of the waiting below together.
-        deadline = time.monotonic() + self._options.close_timeout_ms / 1000
-
-        def remaining() -> float:
-            return max(0.0, deadline - time.monotonic())
-
-        for worker, bound in (
-            (self._storage, timeout + _progress._JOIN_TIMEOUT_SECONDS),
-            (self._checker, _progress._JOIN_TIMEOUT_SECONDS),
-            (self._file, timeout),
-        ):
-            if worker is not None and worker.thread.ident is not None:
-                worker.thread.join(timeout=min(bound, remaining()))
-        checker = self._checker
-        # A blocking query_memory has a known upper bound; wait it out.
-        while checker is not None and checker.thread.is_alive():
-            blocked_until = checker.blocked_until
-            if blocked_until is None:
-                break
-            wait = min(blocked_until - time.monotonic(), remaining())
-            if wait <= 0:
-                break
-            checker.thread.join(timeout=wait)
-        for worker in workers:
-            # A worker leaving its loop just as the wait ended is not stuck.
-            if worker is not None and worker.thread.is_alive():
+        worker = self._storage
+        worker.stop()
+        if worker.thread.ident is not None:
+            # close_timeout_ms bounds the whole wait, a blocked call included.
+            worker.thread.join(timeout=self._options.close_timeout_ms / 1000)
+            if worker.thread.is_alive():
+                # A worker leaving its loop just as the wait ended is not stuck.
                 worker.thread.join(timeout=_FINAL_JOIN_SECONDS)
-        stuck = [worker for worker in self._agent_workers() if worker.thread.is_alive()]
-        for worker in stuck:
+        if worker.thread.is_alive():
             # Exiting while the agent's native threads still run aborts the
-            # process; give the worker the same budget again at exit.
+            # process; give the worker the cleanup budget again at exit.
             atexit.register(
-                worker.thread.join, timeout + _progress._JOIN_TIMEOUT_SECONDS
+                worker.thread.join,
+                _progress._OP_CLEANUP_TIMEOUT_SECONDS + _progress._JOIN_TIMEOUT_SECONDS,
             )
-        if stuck:
-            names = " and ".join(worker.label for worker in stuck)
-            raise RuntimeError(f"G4 {names} worker did not stop")
-        if self._file is not None and self._file.thread.is_alive():
-            raise RuntimeError("G4 file worker did not stop")
-        for worker in workers:
-            if worker is not None and worker.failure is not None:
-                raise worker.failure
+            raise RuntimeError("G4 storage worker did not stop")
+        if worker.failure is not None:
+            raise worker.failure
 
     def is_quiescent(self) -> bool:
-        return (
-            not any(worker.thread.is_alive() for worker in self._agent_workers())
-            and (self._file is None or not self._file.thread.is_alive())
-            and not self._storage.unreleased
-        )
+        return not self._storage.thread.is_alive() and not self._storage.unreleased
 
     def close_main(self) -> None:
         while True:

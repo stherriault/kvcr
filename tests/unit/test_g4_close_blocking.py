@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""The G4 check worker blocked inside query_memory: close and breaker."""
+"""The G4 storage worker blocked in query_memory or a file call: close and breaker."""
 
 import atexit
+import os
 import threading
 import time
 
@@ -22,8 +23,6 @@ KEY = BlockKey(b"hung-head")
 def short_bounds(monkeypatch):
     monkeypatch.setattr(progress, "_OP_CLEANUP_TIMEOUT_SECONDS", 0.1)
     monkeypatch.setattr(progress, "_JOIN_TIMEOUT_SECONDS", 0.1)
-    monkeypatch.setattr(unmanaged_storage, "_QUERY_SECONDS_PER_ROW", 1.0)
-    monkeypatch.setattr(unmanaged_storage, "_QUERY_MARGIN_SECONDS", 0.0)
 
 
 def _hung_check(w):
@@ -40,7 +39,7 @@ def test_g4_close_waits_out_a_blocking_query_within_its_bound(
     threads = threading.active_count()
     w = new_world(g4env, tmp_path, flavor=flavor)
     gate = _hung_check(w)
-    # Past the cleanup and join bounds, inside the per-row query bound.
+    # Past the cleanup and join bounds, inside close_timeout_ms.
     timer = threading.Timer(0.5, gate.set)
     timer.start()
     try:
@@ -52,31 +51,6 @@ def test_g4_close_waits_out_a_blocking_query_within_its_bound(
     assert threading.active_count() == threads
 
 
-@pytest.mark.parametrize("flavor", ["object", "file"])
-def test_g4_close_past_the_query_bound_raises_and_joins_at_exit(
-    g4env, tmp_path, flavor, short_bounds, monkeypatch
-):
-    hooks = []
-    monkeypatch.setattr(
-        atexit, "register", lambda func, *args, **kwargs: hooks.append((func, args))
-    )
-    w = new_world(g4env, tmp_path, flavor=flavor)
-    gate = _hung_check(w)
-    with pytest.raises(RuntimeError, match="storage worker did not stop"):
-        w.kvcr.close()
-    assert not w.kvcr._core.is_quiescent()
-    assert len(hooks) == 1
-    gate.set()
-    func, args = hooks[0]
-    func(*args)
-    assert not w.kvcr._core._g4._storage.thread.is_alive()
-    # Once the call returns, a second close releases everything.
-    w.kvcr.close()
-    assert w.kvcr._core.is_quiescent()
-    assert w.storage.leaks() == []
-    _OPEN_KVCRS.remove(w.kvcr)
-
-
 def test_g4_close_timeout_ms_defaults_to_thirty_seconds():
     options = G4Options(flavor="object", key_prefix="p", key_layout=("",))
     assert options.close_timeout_ms == 30_000
@@ -86,8 +60,6 @@ def test_g4_close_timeout_ms_defaults_to_thirty_seconds():
 def test_g4_close_gives_up_on_a_blocked_call_after_close_timeout_ms(
     g4env, tmp_path, flavor, short_bounds, monkeypatch
 ):
-    # The per-row query bound alone would keep close waiting for 3 s.
-    monkeypatch.setattr(unmanaged_storage, "_QUERY_SECONDS_PER_ROW", 3.0)
     hooks = []
     monkeypatch.setattr(
         atexit, "register", lambda func, *args, **kwargs: hooks.append((func, args))
@@ -148,3 +120,61 @@ def test_g4_opening_the_breaker_cancels_timed_out_checks_queued_behind_a_hung_ca
     w.settle()
     # Only the hung call reached storage; the queued checks were dropped.
     assert w.check_names() == [digest(KEY)]
+
+
+def _blocked_fsync(w, monkeypatch):
+    """Hold the storage worker inside the publish fsync of a spill."""
+    gate = threading.Event()
+    me = threading.get_ident()
+    waiting = []
+    real = os.fsync
+
+    def blocked(fd):
+        if threading.get_ident() != me:
+            waiting.append(fd)
+            gate.wait(10)
+        return real(fd)
+
+    monkeypatch.setattr(os, "fsync", blocked)
+    assert w.deposit(KEY, 0).success
+    w.deposit(BlockKey(b"next"), 1, wait=False)
+    w.poll_until(lambda: bool(waiting))
+    return gate
+
+
+def test_g4_close_waits_out_a_blocked_file_call_within_close_timeout_ms(
+    g4env, tmp_path, short_bounds, monkeypatch
+):
+    threads = threading.active_count()
+    w = new_world(g4env, tmp_path, flavor="file")
+    gate = _blocked_fsync(w, monkeypatch)
+    timer = threading.Timer(0.5, gate.set)
+    timer.start()
+    try:
+        w.kvcr.close()
+    finally:
+        timer.join()
+    assert w.kvcr._core.is_quiescent()
+    assert threading.active_count() == threads
+
+
+def test_g4_close_gives_up_on_a_blocked_file_call_after_close_timeout_ms(
+    g4env, tmp_path, short_bounds, monkeypatch
+):
+    hooks = []
+    monkeypatch.setattr(
+        atexit, "register", lambda func, *args, **kwargs: hooks.append((func, args))
+    )
+    w = new_world(g4env, tmp_path, flavor="file", close_timeout_ms=400)
+    gate = _blocked_fsync(w, monkeypatch)
+    started = time.monotonic()
+    with pytest.raises(RuntimeError, match="storage worker did not stop"):
+        w.kvcr.close()
+    assert time.monotonic() - started < 1.5
+    assert len(hooks) == 1
+    gate.set()
+    func, args = hooks[0]
+    func(*args)
+    w.kvcr.close()
+    assert w.kvcr._core.is_quiescent()
+    _OPEN_KVCRS.remove(w.kvcr)
