@@ -512,10 +512,12 @@ class _G4:
         self._checks: dict[BlockKey, _Check] = {}
         self._pending_start: deque[BlockKey] = deque()
         self._outbox: list[_CheckJob] = []
+        self._timed_out: dict[BlockKey, _CheckJob] = {}
         self._pending_count = 0
         self._inflight = 0
         self._sub_count = 0
         self._results: OrderedDict[tuple[str, BlockKey], bool] = OrderedDict()
+        self._owner_keys: dict[str, set[BlockKey]] = {}
         self._ops: dict[_OpId, _G4Op] = {}
         self._pending_spills: set[BlockKey] = set()
         self._closing = False
@@ -661,10 +663,17 @@ class _G4:
             if now < job.started_at + self._check_timeout:
                 continue
             self._resolve_check(key, check, False)
+            # The job still runs; until its late answer is dropped the key
+            # answers MISS instead of queueing behind it.
+            self._timed_out[key] = job
         self._start_pending(now)
         self.submit_checks()
 
     def _apply_check(self, job: _CheckJob) -> None:
+        if self._timed_out.get(job.key) is job:
+            # Missed at its deadline; the late answer changes nothing.
+            del self._timed_out[job.key]
+            return
         check = self._checks.get(job.key)
         if check is None or check.job is not job:
             return
@@ -719,7 +728,7 @@ class _G4:
         check = self._checks.get(key)
         if check is not None and owner in check.subscribers:
             return _FETCHING
-        if self._closing:
+        if self._closing or key in self._timed_out:
             return _MISS
         held = self._sub_count + self._pending_count + len(self._results)
         if held >= self._options.max_check_results:
@@ -733,6 +742,7 @@ class _G4:
                 self._pending_start.append(key)
         check.subscribers.add(owner)
         self._sub_count += 1
+        self._owner_keys.setdefault(owner, set()).add(key)
         return _FETCHING
 
     def start_check(self, keys: Collection[BlockKey], owner: str) -> None:
@@ -744,7 +754,26 @@ class _G4:
             self.submit_checks()
 
     def _pop_result(self, key: BlockKey, owner: str) -> bool | None:
-        return self._results.pop((owner, key), None)
+        present = self._results.pop((owner, key), None)
+        check = self._checks.get(key)
+        if check is None or owner not in check.subscribers:
+            keys = self._owner_keys.get(owner)
+            if keys is not None:
+                keys.discard(key)
+                if not keys:
+                    del self._owner_keys[owner]
+        return present
+
+    def discard_owner(self, owner: str) -> None:
+        for key in self._owner_keys.pop(owner, ()):
+            self._results.pop((owner, key), None)
+            check = self._checks.get(key)
+            if check is not None and owner in check.subscribers:
+                check.subscribers.discard(owner)
+                self._sub_count -= 1
+                if not check.subscribers and check.job is None:
+                    del self._checks[key]
+                    self._pending_count -= 1
 
     # Reads.
 
@@ -1053,6 +1082,8 @@ class _G4:
                     op.results[key] = _FAILED_RESULT
                 self._kvcr._complete(op.handle, op.results)
         self._checks.clear()
+        self._timed_out.clear()
         self._pending_start.clear()
         self._outbox.clear()
         self._results.clear()
+        self._owner_keys.clear()

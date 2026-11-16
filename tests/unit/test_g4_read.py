@@ -518,6 +518,23 @@ def test_g4_two_requests_share_one_check_and_read_into_own_destinations(
 
 
 @pytest.mark.parametrize("flavor", FLAVORS)
+def test_g4_discard_hint_detaches_a_waiting_subscription(g4env, tmp_path, flavor):
+    w = new_world(g4env, tmp_path, flavor=flavor)
+    w.spill(A, 0)
+    before = w.check_calls()
+    gate = w.hold_checks()
+    assert w.kvcr.query([A], "a") == [fetching_g4()]
+    wait_for(lambda: w.blocked_checks() == 1)
+    assert w.kvcr.query([A], "b") == [fetching_g4()]
+    w.kvcr.discard_hint("a")
+    gate.set()
+    _present(w, A, "b")
+    # The late completion stored nothing for "a": it starts a fresh check.
+    assert w.kvcr.query([A], "a") == [fetching_g4()]
+    wait_for(lambda: w.check_calls() - before == 2)
+
+
+@pytest.mark.parametrize("flavor", FLAVORS)
 def test_g4_full_check_table_queues_keys_instead_of_missing(g4env, tmp_path, flavor):
     w = new_world(g4env, tmp_path, flavor=flavor, max_inflight_checks=2)
     gate = w.hold_checks()
@@ -546,6 +563,18 @@ def test_g4_sixty_five_keys_from_two_requests_all_end_fetchable(
         assert w.await_check(key, "a") == fetchable_g4()
     for key in second:
         assert w.await_check(key, "b") == fetchable_g4()
+
+
+@pytest.mark.parametrize("flavor", FLAVORS)
+def test_g4_max_check_results_misses_new_lookups(g4env, tmp_path, flavor):
+    w = new_world(g4env, tmp_path, flavor=flavor, max_check_results=2)
+    w.hold_checks()
+    assert w.kvcr.query([A], "a") == [fetching_g4()]
+    assert w.kvcr.query([A], "b") == [fetching_g4()]
+    assert w.kvcr.query([A], "c") == [(QueryStatus.MISS, None)]
+    w.kvcr.discard_hint("a")
+    w.kvcr.discard_hint("b")
+    assert w.kvcr.query([A], "c") == [fetching_g4()]
 
 
 @pytest.mark.parametrize("flavor", FLAVORS)

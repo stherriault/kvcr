@@ -11,10 +11,12 @@ import threading
 import pytest
 from _g4_test_utils import (
     PAGE,
+    fetching_g4,
     find_files,
     new_world,
     pattern,
     tmp_files,
+    wait_for,
 )
 from _kvcr_test_utils import _mem_descriptor
 
@@ -228,3 +230,23 @@ def test_g4_mkdir_race_on_a_new_fanout_directory_is_not_an_error(
     w.spill(A, 0)
     assert raced
     assert w.stored(A)
+
+
+# ---- Breaker and existence checks ----
+
+
+@pytest.mark.parametrize("flavor", FLAVORS)
+@pytest.mark.parametrize(("check_ms", "expired"), [(None, True), (3000, False)])
+def test_g4_check_timeout_defaults_to_the_operation_timeout(
+    g4env, tmp_path, flavor, check_ms, expired
+):
+    options = {} if check_ms is None else {"check_timeout_ms": check_ms}
+    w = new_world(g4env, tmp_path, flavor=flavor, **options)
+    w.hold_checks()
+    assert w.kvcr.query([A], "r") == [fetching_g4()]
+    wait_for(lambda: w.blocked_checks() == 1)
+    w.settle(2)
+    w.advance(1.5)
+    assert w.kvcr.query([A], "r") == [MISS if expired else fetching_g4()]
+    w.advance(3.5)
+    assert w.kvcr.query([A], "r") == [MISS]

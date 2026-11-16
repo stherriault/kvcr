@@ -448,6 +448,9 @@ class _KVCRCore:
     def discard_hint(self, request_id: str) -> None:
         self._remote_delivery_keys.pop(request_id, None)
         self._remote_fw_dram.discard_hint(request_id)
+        if self._g4 is not None:
+            with self._state_lock:
+                self._g4.discard_owner(request_id)
 
     def resolve_hashes(
         self, hashes: Collection[int]
