@@ -62,16 +62,29 @@ class G3Options(msgspec.Struct, frozen=True, kw_only=True):
     backend_options: Mapping[str, str] = msgspec.field(default_factory=dict)
 
 
+_SECRET_WORDS = ("key", "secret", "token", "password", "credential")
+
+
+def _redact_options(options: Mapping[str, str]) -> dict[str, str]:
+    def secret(name: str) -> bool:
+        lowered = name.lower()
+        return name != "bucket" and any(word in lowered for word in _SECRET_WORDS)
+
+    return {
+        name: "<redacted>" if secret(name) else value for name, value in options.items()
+    }
+
+
 class G4Options(msgspec.Struct, frozen=True, kw_only=True):
     """Unmanaged remote storage that this KVCR writes and reads but never owns.
 
-    Every block in ``key_prefix`` is one file holding the pieces of
+    Every block in ``key_prefix`` is one object or file holding the pieces of
     ``key_layout`` back to back. Hosts share blocks only when they use the same
     ``key_layout`` labels and pool block sizes. ``None`` timeouts default to
     ``KVCRConfig.operation_timeout_ms``.
     """
 
-    flavor: Literal["file"]
+    flavor: Literal["object", "file"]
     key_prefix: str
     key_layout: tuple[str, ...]
     root: Path | None = None
@@ -80,12 +93,21 @@ class G4Options(msgspec.Struct, frozen=True, kw_only=True):
     max_inflight_checks: int = 64
     max_check_results: int = 65_536
     check_timeout_ms: int | None = None
+    check_batch_max: int = 32
     spill_timeout_ms: int | None = None
     direct_io: bool = True
     failure_threshold: int = 5
     backoff_ms: int = 10_000
     # Total time close() waits for the G4 workers before it raises.
     close_timeout_ms: int = 30_000
+
+    def __repr__(self) -> str:
+        fields = ", ".join(
+            f"{name}={_redact_options(value) if name == 'backend_options' else value!r}"
+            for name in self.__struct_fields__
+            for value in (getattr(self, name),)
+        )
+        return f"G4Options({fields})"
 
 
 class KVCRBackendConfigs(msgspec.Struct, frozen=True):

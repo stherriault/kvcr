@@ -22,7 +22,7 @@ from kvcr.runtime.core import (
 )
 from kvcr.types import BlockKey, QueryStatus
 
-FLAVORS = ["file"]
+FLAVORS = ["object", "file"]
 A = BlockKey(b"block-a")
 B = BlockKey(b"block-b")
 MISS = (QueryStatus.MISS, None)
@@ -208,6 +208,24 @@ def test_g4_deliver_counts_the_payload_bytes_of_a_multi_page_block(
     _present(w)
     assert w.wait(w.deliver(A, 4))[A].success
     assert _transfer(w.metrics(), "g4_deliver") == (1, 2 * PAGE)
+
+
+def test_g4_deliver_finishing_after_its_deadline_is_recorded_as_failed(g4env, tmp_path):
+    w = new_world(g4env, tmp_path, flavor="object", telemetry=True)
+    w.spill(A, 0)
+    _present(w)
+    w.storage.outcome["READ"] = "HOLD"
+    handle = w.deliver(A, 4)
+    wait_for(lambda: len(w.storage.held("READ")) == 1)
+    w.advance(2.0)
+    w.settle()
+    w.storage.finish_all("DONE")
+    assert not w.wait(handle)[A].success
+    metrics = w.metrics()
+    assert list(_durations(metrics, "g4_deliver")) == ["failed"]
+    assert _transfer(metrics, "g4_deliver") == (None, None)
+    counters = _counters(w, OP_COUNTERS)
+    assert (counters["g4_deliver_ok"], counters["g4_deliver_failed"]) == (0, 1)
 
 
 # ---- Existence checks ----

@@ -63,7 +63,7 @@ ERROR_XML = b"<Error><Code>NoSuchKey</Code></Error>"
 FAKE_MODULE = "kvcr_unit_fake_nixl"
 WAIT_SECONDS = 3.0
 # What a failing check reports, per flavor (the file flavor fails with EIO).
-CHECK_ERROR_TEXT = {"file": "check failed"}
+CHECK_ERROR_TEXT = {"object": "endpoint down", "file": "check failed"}
 
 
 _PROBES = itertools.count()
@@ -163,13 +163,26 @@ class _Registration:
 
 
 class FakeG4Agent:
-    """Storage-side NIXL agent for the OBJ and POSIX plugins."""
+    """Storage-side NIXL agent for the OBJ and POSIX plugins.
 
-    def __init__(self, store: FakeStorage | None = None) -> None:
+    The agent named ``<agent>-g4`` carries transfers. A second agent created
+    for the check worker is a peer: it records its own calls and threads but
+    answers query_memory from the first agent's store and knobs, so one set of
+    knobs steers every existence check.
+    """
+
+    def __init__(
+        self,
+        store: FakeStorage | None = None,
+        primary: "FakeG4Agent | None" = None,
+    ) -> None:
+        self.primary = primary
+        self.check_peer: FakeG4Agent | None = None
         self.store = store if store is not None else FakeStorage()
         self.name = ""
         self._lock = threading.RLock()
         self.backends: dict[str, dict[str, str]] = {}
+        self.env_at_create: dict[str, str | None] = {}
         self.create_error: Exception | None = None
         self.calls: list[tuple[str, int]] = []
         self.dram_regs: list[_Registration] = []
@@ -182,8 +195,16 @@ class FakeG4Agent:
         self.xfer_log: list[_Xfer] = []
         self.xfers: dict[int, _Xfer] = {}
         self.released: list[int] = []
-        # Called with the method name at the start of every call on this
-        # agent; raise from it to make a worker thread die.
+        self.query_calls: list[tuple[str, ...]] = []
+        self.query_blocked = 0
+        self.query_gate: threading.Event | None = None
+        self.query_error: Exception | None = None
+        self.query_error_if: Callable[[tuple[str, ...]], bool] | None = None
+        # Seconds one query_memory call takes, whatever its row count: the
+        # OBJ plugin runs the HEADs of one call concurrently.
+        self.query_latency = 0.0
+        # Called with the method name at the start of every call on this agent
+        # (and on its check peer); raise from it to make a worker thread die.
         self.fault: Callable[[str], None] | None = None
         self.fd_direct: list[bool] = []
         self.init_gate: threading.Event | None = None
@@ -197,7 +218,7 @@ class FakeG4Agent:
     def _record(self, method: str) -> None:
         with self._lock:
             self.calls.append((method, threading.get_ident()))
-        fault = self.fault
+        fault = (self.primary or self).fault
         if fault is not None:
             fault(method)
 
@@ -211,10 +232,11 @@ class FakeG4Agent:
 
     def create_backend(self, backend, params=None):
         self._record("create_backend")
-        error = self.create_error
+        error = (self.primary or self).create_error
         if error is not None:
             raise error
         self.backends[backend] = dict(params or {})
+        self.env_at_create[backend] = os.environ.get("AWS_EC2_METADATA_DISABLED")
 
     def get_backend_params(self, backend):
         self._record("get_backend_params")
@@ -264,6 +286,31 @@ class FakeG4Agent:
                 if handle in registry:
                     registry.remove(handle)
         return True
+
+    def query_memory(self, reg_list, backend, mem_type=None):
+        self._record("query_memory")
+        return (self.primary or self)._answer(reg_list)
+
+    def _answer(self, reg_list):
+        rows = [tuple(row) for row in reg_list]
+        with self._lock:
+            self.query_calls.append(tuple(str(row[3]) for row in rows))
+        gate = self.query_gate
+        if gate is not None and not gate.is_set():
+            with self._lock:
+                self.query_blocked += 1
+            gate.wait(10)
+            with self._lock:
+                self.query_blocked -= 1
+        if self.query_latency:
+            time.sleep(self.query_latency)
+        if self.query_error is not None:
+            raise self.query_error
+        if self.query_error_if is not None and self.query_error_if(
+            tuple(str(row[3]) for row in rows)
+        ):
+            raise RuntimeError("batch rejected")
+        return [{} if row[3] in self.store.objects else None for row in rows]
 
     def get_xfer_descs(self, descs, mem_type=None):
         self._record("get_xfer_descs")
@@ -421,8 +468,9 @@ class FakeG4Agent:
             return [x.handle for x in self.xfer_log if not x.released]
 
     def open_gates(self) -> None:
-        if self.init_gate is not None:
-            self.init_gate.set()
+        for gate in (self.query_gate, self.init_gate):
+            if gate is not None:
+                gate.set()
         self.finish_all("DONE")
 
     def leaks(self) -> list[str]:
@@ -519,8 +567,14 @@ class FakeNixlEnv:
         if self._main is not None and not self._main_taken and name == self._main_name:
             self._main_taken = True
             agent: Any = self._main
-        else:
+        elif name == self._main_name or name.endswith("-g4"):
             agent = self._storage
+        else:
+            # Any other storage agent belongs to the check worker.
+            agent = FakeG4Agent(primary=self._storage)
+            agent.store = self._storage.store
+            self._storage.check_peer = agent
+            self.agents.append(agent)
         agent.name = name
         return agent
 
@@ -563,8 +617,26 @@ def g4_options(flavor: str, root: Path | None, key_layout=None, **kwargs):
 
     # The suite runs on any tmp_path, which may refuse O_DIRECT.
     kwargs.setdefault("direct_io", False)
+    if flavor == "object":
+        kwargs.setdefault(
+            "backend_options",
+            {
+                "bucket": "unit",
+                "endpoint_override": "127.0.0.1:1",
+                "scheme": "http",
+                "access_key": "unit-access",
+                "secret_key": "unit-secret",
+            },
+        )
+        return G4Options(
+            flavor="object",
+            key_prefix=kwargs.pop("key_prefix", PREFIX),
+            key_layout=tuple(key_layout if key_layout is not None else ("",)),
+            root=root,
+            **kwargs,
+        )
     return G4Options(
-        flavor=flavor,
+        flavor="file",
         key_prefix=kwargs.pop("key_prefix", PREFIX),
         key_layout=tuple(key_layout if key_layout is not None else ("",)),
         root=root,
@@ -640,6 +712,8 @@ class World:
         assert self.stored(key)
 
     def stored(self, key: BlockKey) -> bool:
+        if self.flavor == "object":
+            return self.store.find(key, self.prefix) is not None
         return bool(find_files(self.root, key, self.prefix))
 
     def await_check(self, key: BlockKey, rid: str = "r"):
@@ -661,6 +735,19 @@ class World:
 
     def advance(self, seconds: float) -> None:
         self.now[0] = seconds
+
+    def real_clock(self) -> None:
+        """Use wall time for deadlines, for tests that model call latency."""
+        self.kvcr._core._clock = time.monotonic
+
+    def plant(self, keys) -> None:
+        """Object flavor: store a block for each key without spilling it."""
+        seed = BlockKey(b"plant-seed")
+        self.spill(seed, 0)
+        tag = self.store.find(seed, self.prefix).split("/")[-3]
+        for key in keys:
+            name = f"{self.prefix}/{tag}/{digest(key)[:2]}/{digest(key)}"
+            self.store.objects[name] = pattern(0, self.piece)
 
     def install_stat_spy(self) -> None:
         """File flavor: record, gate and fail the existence checks (stat calls)."""
@@ -694,25 +781,40 @@ class World:
         """Block every existence check until the returned event is set."""
         gate = threading.Event()
         self.env.gates.append(gate)
-        self.stat_gate = gate
+        if self.flavor == "object":
+            self.storage.query_gate = gate
+        else:
+            self.stat_gate = gate
         return gate
 
     def blocked_checks(self) -> int:
-        return self.stat_blocked
+        return (
+            self.storage.query_blocked if self.flavor == "object" else self.stat_blocked
+        )
 
     def check_names(self) -> list[str]:
         """Digests of the keys checked so far, in call order."""
-        return list(self.stat_log)
+        if self.flavor == "file":
+            return list(self.stat_log)
+        return [n.split("/")[-1] for call in self.storage.query_calls for n in call]
 
     def check_calls(self) -> int:
-        """Storage calls made for checks."""
+        """Storage calls made for checks (a batch is one call on OBJ)."""
+        if self.flavor == "object":
+            return len(self.storage.query_calls)
         return len(self.stat_log)
 
     def fail_checks(self) -> None:
-        self.stat_error = True
+        if self.flavor == "object":
+            self.storage.query_error = RuntimeError(CHECK_ERROR_TEXT["object"])
+        else:
+            self.stat_error = True
 
     def heal_checks(self) -> None:
-        self.stat_error = False
+        if self.flavor == "object":
+            self.storage.query_error = None
+        else:
+            self.stat_error = False
 
     def query_only(self, key: BlockKey, rid: str = "r"):
         """Wait for a check result using query alone, never poll_completed."""
@@ -759,6 +861,11 @@ class World:
         answer = self.kvcr.query([key], "breaker-probe")[0]
         self.settle(5)
         return answer == (QueryStatus.MISS, None) and self.check_calls() == calls
+
+    @property
+    def check_agent(self) -> FakeG4Agent:
+        """The agent that answers existence checks (the storage agent if shared)."""
+        return self.storage.check_peer or self.storage
 
     @property
     def local_dram(self):
@@ -813,7 +920,7 @@ def new_world(
     env: FakeNixlEnv,
     tmp_path: Path,
     *,
-    flavor: str = "file",
+    flavor: str = "object",
     slots: int = 1,
     store: FakeStorage | None = None,
     root: Path | None = None,
@@ -876,6 +983,9 @@ def new_world(
         g3=g3,
     )
     world.kvcr._core._clock = lambda: world.now[0]
+    # A startup existence check is not one of the test's own checks.
+    world.startup_queries = list(world.storage.query_calls)
+    world.storage.query_calls.clear()
     if flavor == "file" and world.root is not None:
         world.install_stat_spy()
     return world

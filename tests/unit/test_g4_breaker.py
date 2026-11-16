@@ -8,7 +8,9 @@ import re
 import pytest
 from _g4_test_utils import (
     CHECK_ERROR_TEXT,
+    digest,
     fetchable_g4,
+    fetching_g4,
     find_files,
     new_world,
     wait_for,
@@ -16,7 +18,7 @@ from _g4_test_utils import (
 
 from kvcr.types import BlockKey, QueryStatus
 
-FLAVORS = ["file"]
+FLAVORS = ["object", "file"]
 A = BlockKey(b"block-a")
 B = BlockKey(b"block-b")
 C = BlockKey(b"block-c")
@@ -128,6 +130,39 @@ def test_g4_telemetry_state_reports_breaker_state_and_failures(g4env, tmp_path, 
     assert w.wait(w.deliver(A, 4, "trial"))[A].success
     state = w.g4_state()
     assert (state["g4_breaker_state"], state["g4_breaker_failures"]) == (0, 0)
+
+
+# ---- Startup validates the bucket (object flavor) ----
+
+BUCKET = "kvcr-test-bucket"
+OPTIONS = {
+    "bucket": BUCKET,
+    "endpoint_override": "127.0.0.1:1",
+    "scheme": "http",
+    "access_key": "unit-access",
+    "secret_key": "unit-secret",
+}
+
+
+def test_g4_obj_startup_makes_one_existence_check_against_the_bucket(g4env, tmp_path):
+    w = new_world(g4env, tmp_path, flavor="object", backend_options=OPTIONS)
+    assert len(w.startup_queries) == 1
+    assert len(w.startup_queries[0]) == 1
+    assert w.storage.backends["OBJ"]["bucket"] == BUCKET
+
+
+def test_g4_obj_startup_fails_clearly_when_the_bucket_check_errors(g4env, tmp_path):
+    def broken(agent):
+        agent.query_error = RuntimeError("NoSuchBucket")
+
+    with pytest.raises((ValueError, RuntimeError), match=BUCKET):
+        new_world(
+            g4env,
+            tmp_path,
+            flavor="object",
+            backend_options=OPTIONS,
+            storage_setup=broken,
+        )
 
 
 # ---- Consecutive failures ----
@@ -353,6 +388,37 @@ def test_g4_no_read_error_probe_starts_while_the_breaker_is_not_closed(
     assert not w.wait(handle)[A].success
     w.settle(50)
     assert w.check_names() == checks
+
+
+def test_g4_probes_queued_behind_a_blocked_check_are_dropped_when_the_breaker_opens(
+    g4env, tmp_path
+):
+    w = new_world(
+        g4env, tmp_path, flavor="object", failure_threshold=1, check_timeout_ms=500
+    )
+    w.spill(A, 0)
+    w.spill(B, 1)
+    assert w.await_check(A, "ra") == fetchable_g4()
+    assert w.await_check(B, "rb") == fetchable_g4()
+    earlier = list(w.check_names())
+    w.storage.outcome["READ"] = "HOLD"
+    handles = [w.deliver(A, 4, "ra"), w.deliver(B, 5, "rb")]
+    wait_for(lambda: len(w.storage.held("READ")) == 2)
+    gate = w.hold_checks()
+    assert w.kvcr.query([_fresh(1)], "x") == [fetching_g4()]
+    wait_for(lambda: w.blocked_checks() == 1)
+    w.settle(2)
+    # Both reads fail while the check is stuck, so their probes wait behind it.
+    w.storage.finish_all("ERR")
+    w.settle(50)
+    # The stuck check passes its deadline (the reads are still inside theirs).
+    w.advance(0.6)
+    assert w.kvcr.query([_fresh(1)], "x") == [MISS]
+    gate.set()
+    for handle, key in zip(handles, (A, B), strict=True):
+        assert not w.wait(handle)[key].success
+    w.settle(50)
+    assert w.check_names() == [*earlier, digest(_fresh(1))]
 
 
 @pytest.mark.parametrize("flavor", FLAVORS)
