@@ -24,6 +24,7 @@ from ..backends.local_dram_pools import (
     _LocalDramResidency,
     _LocalDramState,
 )
+from ..backends.unmanaged_storage import _G4
 from ..config import (
     KVCRBackendConfigs,
     KVCRConfig,
@@ -228,6 +229,9 @@ class _KVCRCore:
         self._stats_factory = bindings.stats_factory
         local_dram_config = backend_configs.local_dram
         g3_config = backend_configs.g3
+        g4_config = backend_configs.g4
+        if g4_config is not None and local_dram_config is None:
+            raise ValueError("G4 requires configured local DRAM")
         policy = bindings.policy
         if policy is None:
             policy = G3LRUPolicy() if g3_config is not None else LRUPolicy()
@@ -236,6 +240,8 @@ class _KVCRCore:
             configured_tiers.add(CacheTier.LOCAL_G2)
         if g3_config is not None:
             configured_tiers.add(CacheTier.G3)
+        if g4_config is not None:
+            configured_tiers.add(CacheTier.G4)
         missing_tiers = policy.required_tiers - configured_tiers
         if missing_tiers:
             names = ", ".join(sorted(tier.value for tier in missing_tiers))
@@ -318,6 +324,7 @@ class _KVCRCore:
         if not any(self._capacity_low_watermarks.values()):
             self._capacity_needed_callback = None
         self._remote_fw_dram = _RemoteFWDram(self, backend_configs.remote_fw_dram)
+        self._g4 = _G4(self, g4_config) if g4_config is not None else None
         self._nvtx = self._remote_fw_dram._nvtx
         self._nvtx_operations = {}
         self._g3 = (

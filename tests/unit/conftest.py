@@ -37,3 +37,13 @@ def kvcr_caplog(caplog):
             yield caplog
     finally:
         kvcr_logger.removeHandler(caplog.handler)
+
+
+@pytest.fixture()
+def g4env(monkeypatch):
+    """Route KVCR's NIXL agents to fakes; release held fake transfers at teardown."""
+    from _g4_test_utils import FakeNixlEnv
+
+    env = FakeNixlEnv(monkeypatch)
+    yield env
+    env.release_all()

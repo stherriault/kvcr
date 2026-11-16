@@ -4,7 +4,7 @@
 
 from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import Protocol
+from typing import Literal, Protocol
 
 import msgspec
 
@@ -62,6 +62,20 @@ class G3Options(msgspec.Struct, frozen=True, kw_only=True):
     backend_options: Mapping[str, str] = msgspec.field(default_factory=dict)
 
 
+class G4Options(msgspec.Struct, frozen=True, kw_only=True):
+    """Unmanaged remote storage that this KVCR writes and reads but never owns.
+
+    Every block in ``key_prefix`` is one file holding the pieces of
+    ``key_layout`` back to back. Hosts share blocks only when they use the same
+    ``key_layout`` labels and pool block sizes.
+    """
+
+    flavor: Literal["file"]
+    key_prefix: str
+    key_layout: tuple[str, ...]
+    root: Path | None = None
+
+
 class KVCRBackendConfigs(msgspec.Struct, frozen=True):
     framework_regions: list[RegionDescriptor] = msgspec.field(default_factory=list)
     local_dram: LocalDramOptions | None = None
@@ -69,6 +83,7 @@ class KVCRBackendConfigs(msgspec.Struct, frozen=True):
     remote_fw_dram: RemoteFWDramOptions = msgspec.field(
         default_factory=RemoteFWDramOptions
     )
+    g4: G4Options | None = None
 
 
 class TelemetryStats(Protocol):
