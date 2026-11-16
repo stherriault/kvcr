@@ -80,6 +80,7 @@ class G4Options(msgspec.Struct, frozen=True, kw_only=True):
     max_inflight_checks: int = 64
     max_check_results: int = 65_536
     check_timeout_ms: int | None = None
+    direct_io: bool = True
 
 
 class KVCRBackendConfigs(msgspec.Struct, frozen=True):

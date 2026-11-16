@@ -30,6 +30,7 @@ from _kvcr_test_utils import (
     FakeBytesControl,
     FakeNixlAgent,
     FakePrimaryPinning,
+    _mem_descriptor,
 )
 
 from kvcr import KVCR, KVCRBindings
@@ -64,6 +65,10 @@ def fetching_g4():
     return (QueryStatus.FETCHING, CacheTier.G4)
 
 
+def fetchable_g4():
+    return (QueryStatus.FETCHABLE, CacheTier.G4)
+
+
 def aligned(size: int):
     """Page-aligned ctypes buffer (O_DIRECT needs aligned memory)."""
     mapping = mmap.mmap(-1, size)
@@ -85,6 +90,10 @@ def digest(key: BlockKey) -> str:
     return hashlib.sha256(bytes(key)).hexdigest()
 
 
+def pattern(index: int, size: int = PAGE) -> bytes:
+    return bytes([(index * 7 + 3) % 251 + 1]) * size
+
+
 class FakeStorage:
     """Object store contents, shared by every agent that points at it."""
 
@@ -97,6 +106,15 @@ class FakeStorage:
             if name.startswith(prefix + "/") and name.endswith(suffix):
                 return name
         return None
+
+
+def find_files(root: Path, key: BlockKey, prefix: str = PREFIX) -> list[Path]:
+    d = digest(key)
+    return sorted((root / prefix).glob(f"*/{d[:2]}/{d}"))
+
+
+def tmp_files(root: Path) -> list[Path]:
+    return sorted(path for path in root.rglob("*.tmp.*") if path.is_file())
 
 
 @dataclass
@@ -523,6 +541,8 @@ class _MoveToG4Policy(FIFOPolicy):
 def g4_options(flavor: str, root: Path | None, key_layout=None, **kwargs):
     from kvcr.config import G4Options
 
+    # The suite runs on any tmp_path, which may refuse O_DIRECT.
+    kwargs.setdefault("direct_io", False)
     return G4Options(
         flavor=flavor,
         key_prefix=kwargs.pop("key_prefix", PREFIX),
@@ -554,6 +574,54 @@ class World:
             time.sleep(0.001)
         return self.results[handle]
 
+    def settle(self, rounds: int = 20) -> None:
+        """Poll a bounded number of times; used before a negative assertion."""
+        for _ in range(rounds):
+            self.poll()
+            time.sleep(0.001)
+
+    def poll_until(self, predicate, *, timeout: float = WAIT_SECONDS) -> None:
+        deadline = time.monotonic() + timeout
+        while not predicate():
+            if time.monotonic() > deadline:
+                raise AssertionError("condition was not reached")
+            self.poll()
+            time.sleep(0.001)
+
+    def element(self, index: int) -> bytes:
+        return bytes(self.engine_view[index * self.piece : (index + 1) * self.piece])
+
+    def fill(self, index: int, data: bytes | None = None) -> None:
+        data = data if data is not None else pattern(index, self.piece)
+        self.engine_view[index * self.piece : (index + 1) * self.piece] = data
+
+    def clear(self, index: int) -> None:
+        self.fill(index, b"\0" * self.piece)
+
+    def deposit(self, key: BlockKey, index: int, *, wait: bool = True):
+        self.fill(index)
+        handle = self.kvcr.deposit({key: [self.ref(index)]})
+        return self.wait(handle)[key] if wait else handle
+
+    def ref(self, index: int, label: str = ""):
+        name = self.kvcr.config.nixl_agent_name
+        return _mem_descriptor(index, label, end_point_name=name)
+
+    def start_spill(self, key: BlockKey, index: int) -> int:
+        """Deposit key, then a filler that evicts it; return the filler handle."""
+        assert self.deposit(key, index).success
+        self.fillers += 1
+        self.filler = BlockKey(f"filler-{self.fillers}".encode())
+        return self.deposit(self.filler, 7, wait=False)
+
+    def spill(self, key: BlockKey, index: int) -> None:
+        handle = self.start_spill(key, index)
+        assert self.wait(handle)[self.filler].success
+        assert self.stored(key)
+
+    def stored(self, key: BlockKey) -> bool:
+        return bool(find_files(self.root, key, self.prefix))
+
     def await_check(self, key: BlockKey, rid: str = "r"):
         deadline = time.monotonic() + WAIT_SECONDS
         while True:
@@ -564,6 +632,15 @@ class World:
                 raise AssertionError("existence check did not finish")
             self.poll()
             time.sleep(0.001)
+
+    def deliver(self, key: BlockKey, index: int, rid: str = "r") -> int:
+        return self.kvcr.deliver({key: [self.ref(index)]}, rid)
+
+    def fetch(self, key: BlockKey, rid: str = "r") -> int:
+        return self.kvcr.fetch((key,), rid)
+
+    def advance(self, seconds: float) -> None:
+        self.now[0] = seconds
 
     def install_stat_spy(self) -> None:
         """File flavor: record, gate and fail the existence checks (stat calls)."""
@@ -606,6 +683,21 @@ class World:
     def check_names(self) -> list[str]:
         """Digests of the keys checked so far, in call order."""
         return list(self.stat_log)
+
+    def check_calls(self) -> int:
+        """Storage calls made for checks."""
+        return len(self.stat_log)
+
+    def query_only(self, key: BlockKey, rid: str = "r"):
+        """Wait for a check result using query alone, never poll_completed."""
+        deadline = time.monotonic() + WAIT_SECONDS
+        while True:
+            status = self.kvcr.query([key], rid)[0]
+            if status[0] is not QueryStatus.FETCHING:
+                return status
+            if time.monotonic() > deadline:
+                raise AssertionError("check result never reached query")
+            time.sleep(0.001)
 
     @property
     def local_dram(self):
@@ -722,6 +814,103 @@ def new_world(
     return world
 
 
+def new_hybrid_world(
+    env: FakeNixlEnv,
+    tmp_path: Path,
+    *,
+    key_layout=("full", "swa:a", "swa:b"),
+    flavor: str = "file",
+    store: FakeStorage | None = None,
+    **g4_kwargs,
+) -> World:
+    """One-block G2 with pools full (2 pages) and swa (1 page, 2 slots).
+
+    Block i uses framework element i of `full` and elements 2i, 2i+1 of `swa`.
+    """
+    world = World()
+    world.env = env
+    world.flavor = flavor
+    world.piece = PAGE
+    world.prefix = PREFIX
+    world.store = store if store is not None else FakeStorage()
+    world.root = tmp_path / "g4root"
+    world.root.mkdir(exist_ok=True)
+    world.primary = {
+        "full": aligned(6 * PAGE),
+        "swa": aligned(6 * PAGE),
+    }
+    world.local_bufs = {
+        "full": aligned(2 * PAGE),
+        "swa": aligned(2 * PAGE),
+    }
+    for index in range(3):
+        world.primary["full"][index * 2 * PAGE : (index + 1) * 2 * PAGE] = pattern(
+            index, 2 * PAGE
+        )
+    for index in range(6):
+        world.primary["swa"][index * PAGE : (index + 1) * PAGE] = pattern(
+            index + 10, PAGE
+        )
+    named = ":" in key_layout[1] if len(key_layout) > 1 else False
+    world.main = FakeMainAgent()
+    world.storage = FakeG4Agent(world.store)
+    world.policy = _MoveToG4Policy()
+    world.options = g4_options(flavor, world.root, key_layout=key_layout, **g4_kwargs)
+    world.kvcr = build_kvcr(
+        env,
+        main=world.main,
+        storage=world.storage,
+        config=KVCRConfig(
+            nixl_agent_name="target",
+            pool_layouts=[("full", 2 * PAGE), ("swa", PAGE)],
+        ),
+        framework_regions=[
+            RegionDescriptor(
+                addr=ctypes.addressof(world.primary["full"]),
+                size=2 * PAGE,
+                label="full",
+                count=3,
+            ),
+            RegionDescriptor(
+                addr=ctypes.addressof(world.primary["swa"]),
+                size=PAGE,
+                label="swa:*" if named else "swa",
+                count=6,
+            ),
+        ],
+        local_dram=LocalDramOptions(
+            [
+                (name, ctypes.addressof(buf), len(buf))
+                for name, buf in world.local_bufs.items()
+            ]
+        ),
+        g4=world.options,
+        policy=world.policy,
+        on_resilience_event=world.events.append,
+    )
+    world.kvcr._core._clock = lambda: world.now[0]
+    world.layout = tuple(key_layout)
+    if flavor == "file":
+        world.install_stat_spy()
+    return world
+
+
+def hybrid_refs(index: int, layout=("full", "swa:a", "swa:b")):
+    return [
+        _mem_descriptor(index, layout[0]),
+        _mem_descriptor(2 * index, layout[1]),
+        _mem_descriptor(2 * index + 1, layout[2]),
+    ]
+
+
+def hybrid_block_bytes(world: World, index: int) -> bytes:
+    """Payload of block `index` in key_layout order (full, swa, swa)."""
+    full = bytes(world.primary["full"][index * 2 * PAGE : (index + 1) * 2 * PAGE])
+    a = bytes(world.primary["swa"][2 * index * PAGE : (2 * index + 1) * PAGE])
+    b = bytes(world.primary["swa"][(2 * index + 1) * PAGE : (2 * index + 2) * PAGE])
+    return full + a + b
+
+
 __all__ = [
     "ERROR_XML",
     "NixlBackendError",
@@ -733,8 +922,15 @@ __all__ = [
     "PREFIX",
     "World",
     "build_kvcr",
+    "fetchable_g4",
     "fetching_g4",
+    "find_files",
     "g4_options",
+    "hybrid_block_bytes",
+    "hybrid_refs",
+    "new_hybrid_world",
     "new_world",
+    "pattern",
+    "tmp_files",
     "wait_for",
 ]

@@ -44,6 +44,7 @@ from ..types import (
     OpHandle,
     OpResult,
     PinHandle,
+    PlacementAction,
     PlacementDecision,
     QueryStatus,
     RecoveryMirrorError,
@@ -246,10 +247,12 @@ class _KVCRCore:
         if missing_tiers:
             names = ", ".join(sorted(tier.value for tier in missing_tiers))
             raise ValueError(f"{type(policy).__name__} requires configured {names}")
-        self._policy = _PolicyInvoker(
-            policy,
-            (((CacheTier.LOCAL_G2, CacheTier.G3),) if g3_config is not None else ()),
-        )
+        allowed_moves = []
+        if g3_config is not None:
+            allowed_moves.append((CacheTier.LOCAL_G2, CacheTier.G3))
+        if g4_config is not None:
+            allowed_moves.append((CacheTier.LOCAL_G2, CacheTier.G4))
+        self._policy = _PolicyInvoker(policy, allowed_moves)
 
         # Common KVCR state tables.
         if g3_config is not None and local_dram_config is None:
@@ -346,6 +349,8 @@ class _KVCRCore:
         )
         self._memory_regions = (framework_regions, kvcr_regions)
         _validate_memory_regions([*framework_regions.values(), *kvcr_regions.values()])
+        if self._g4 is not None:
+            self._g4.check_dram_alignment()
         dram_backends: set[str] = set()
         if self._local_dram is not None:
             dram_backends.add(local_dram_config.backend)
@@ -1423,6 +1428,10 @@ class _KVCRCore:
     ) -> tuple[PlacementDecision, bool]:
         """Return the resolved decision and whether capacity is pending."""
         decision = self._policy.decide_eviction(meta, source)
+        if decision == (PlacementAction.MOVE_TO, CacheTier.G4):
+            if self._g4 is None:
+                return (PlacementAction.KEEP, None), False
+            return self._g4.resolve_eviction(meta, source, decision, deadline)
         if self._g3 is not None:
             return self._g3.resolve_eviction(meta, source, decision, deadline)
         return decision, False
