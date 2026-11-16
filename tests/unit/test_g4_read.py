@@ -504,15 +504,57 @@ def test_g4_obj_checks_and_probes_run_on_their_own_agent_and_thread(g4env, tmp_p
     assert check_threads.isdisjoint(w.main.threads())
 
 
-def test_g4_file_checks_run_on_the_file_worker_not_the_storage_thread(g4env, tmp_path):
+def test_g4_file_checks_run_on_their_own_agent_and_thread(g4env, tmp_path):
+    w = new_world(g4env, tmp_path, flavor="file")
+    w.spill(A, 0)
+    started = len(w.storage.calls)
+    _present(w)
+    assert w.wait(w.deliver(A, 4))[A].success
+    storage_calls = [name for name, _ in w.storage.calls[started:]]
+    assert "query_memory" not in storage_calls
+    check_threads = {ident for _, ident in w.check_agent.calls}
+    assert len(check_threads) == 1
+    assert check_threads.isdisjoint(w.storage.threads())
+    assert threading.get_ident() not in check_threads
+    assert check_threads.isdisjoint(w.main.threads())
+
+
+def test_g4_file_check_agent_is_not_the_transfer_agent(g4env, tmp_path):
     w = new_world(g4env, tmp_path, flavor="file")
     w.spill(A, 0)
     _present(w)
-    assert w.wait(w.deliver(A, 4))[A].success
-    assert "query_memory" not in [name for name, _ in w.storage.calls]
-    assert len(w.stat_threads) == 1
-    assert w.stat_threads.isdisjoint(w.storage.threads())
-    assert threading.get_ident() not in w.stat_threads
+    assert w.check_agent is not w.storage
+    assert w.check_agent.name != w.storage.name
+
+
+def test_g4_file_checks_ask_the_nixl_file_query_for_the_final_path(g4env, tmp_path):
+    w = new_world(g4env, tmp_path, flavor="file")
+    w.spill(A, 0)
+    _present(w)
+    (path,) = find_files(w.root, A)
+    assert w.storage.query_rows == [((0, 0, 0, str(path)),)]
+
+
+def test_g4_file_checks_use_the_file_memory_type_on_the_posix_backend(g4env, tmp_path):
+    w = new_world(g4env, tmp_path, flavor="file")
+    w.spill(A, 0)
+    _present(w)
+    assert w.storage.query_types == [("FILE", "POSIX")]
+
+
+def test_g4_file_checks_do_not_stat_the_block_path(g4env, tmp_path):
+    w = new_world(g4env, tmp_path, flavor="file")
+    w.spill(A, 0)
+    _present(w)
+    assert w.await_check(BlockKey(b"never-stored"), "m") == (QueryStatus.MISS, None)
+    assert w.stat_log == []
+
+
+def test_g4_file_check_of_a_missing_file_is_a_miss_from_a_none_answer(g4env, tmp_path):
+    w = new_world(g4env, tmp_path, flavor="file")
+    assert w.await_check(A) == (QueryStatus.MISS, None)
+    assert w.check_names() == [digest(A)]
+    assert w.storage.log("READ") == []
 
 
 def test_g4_obj_transfer_is_not_delayed_by_a_check_blocked_in_storage(g4env, tmp_path):
@@ -692,11 +734,12 @@ def test_g4_deliver_past_abandon_timeout_reports_uncertain_then_quiesced(
 
 
 @pytest.mark.parametrize("delta", [-1, 1])
-def test_g4_file_stat_size_mismatch_is_a_miss(g4env, tmp_path, delta):
+def test_g4_file_query_size_mismatch_is_a_miss(g4env, tmp_path, delta):
     w = new_world(g4env, tmp_path, flavor="file")
     w.spill(A, 0)
     os.truncate(_stored_path(w), w.piece + delta)
     assert w.await_check(A) == (QueryStatus.MISS, None)
+    assert w.check_names() == [digest(A)]
     assert w.storage.log("READ") == []
 
 
@@ -848,14 +891,15 @@ def test_g4_query_alone_sees_check_results_without_poll_completed(
     assert w.query_only(A) == fetchable_g4()
 
 
-# ---- OBJ check batching ----
+# ---- Check batching ----
 
 
+@pytest.mark.parametrize("flavor", FLAVORS)
 @pytest.mark.parametrize(("batch_max", "sizes"), [(32, [1, 5]), (3, [1, 3, 2])])
-def test_g4_queued_obj_checks_share_query_memory_calls(
-    g4env, tmp_path, batch_max, sizes
+def test_g4_queued_checks_share_query_memory_calls(
+    g4env, tmp_path, flavor, batch_max, sizes
 ):
-    w = new_world(g4env, tmp_path, flavor="object", check_batch_max=batch_max)
+    w = new_world(g4env, tmp_path, flavor=flavor, check_batch_max=batch_max)
     gate = w.hold_checks()
     keys = [BlockKey(f"k{i}".encode()) for i in range(6)]
     assert w.kvcr.query(keys[:1], "r") == [fetching_g4()]

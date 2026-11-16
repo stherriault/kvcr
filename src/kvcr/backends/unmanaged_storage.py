@@ -7,9 +7,9 @@ KVCR keeps no G4 index. ``query`` starts an existence check, ``fetch`` and
 LOCAL_G2 eviction writes the victim and publishes it atomically.
 
 Threads: transfers run on the G4 storage worker, which owns the storage
-agent. Object flavor existence checks and read-error probes run on the G4
-check worker, which owns a second storage agent, so a slow HEAD never delays
-a transfer. Every file system call runs on the G4 file worker. Core state
+agent. Existence checks, and object flavor read-error probes, run on the G4
+check worker, which owns a second storage agent, so a slow check never delays
+a transfer. Every other file system call runs on the G4 file worker. Core state
 changes only on caller threads under ``_state_lock``; workers report through
 completion queues that ``poll_completed`` (and ``query``, for checks) drain.
 
@@ -490,7 +490,7 @@ class _StorageWorker:
 
 
 class _CheckWorker:
-    """Object flavor: owns the check agent and runs existence checks and probes."""
+    """Owns the check agent; runs existence checks and object flavor probes."""
 
     label = "check storage"
 
@@ -523,6 +523,11 @@ class _CheckWorker:
     def _setup(self) -> None:
         g4 = self._g4
         self.agent = _create_agent(g4, self.agent_name)
+        if g4._flavor == "object":
+            self._check_bucket()
+
+    def _check_bucket(self) -> None:
+        g4 = self._g4
         # One HEAD at startup turns a wrong bucket, endpoint or credential
         # into a start error; absent and present both prove access.
         name = f"{g4._prefix}/{g4._layout_tag}/.startup-check"
@@ -588,17 +593,24 @@ class _CheckWorker:
         self._next_batch += 1
         for job in jobs:
             job.batch = self._next_batch
-        rows = [(0, g4._payload_len, 0, job.name) for job in jobs]
+        if g4._flavor == "file":
+            kind = "FILE"
+            rows = [(0, 0, 0, job.name) for job in jobs]
+        else:
+            kind = "OBJ"
+            rows = [(0, g4._payload_len, 0, job.name) for job in jobs]
         self.blocked_until = (
             time.monotonic()
             + len(rows) * _QUERY_SECONDS_PER_ROW
             + _QUERY_MARGIN_SECONDS
         )
         try:
-            answers = list(self.agent.query_memory(rows, g4._backend, mem_type="OBJ"))
+            answers = list(self.agent.query_memory(rows, g4._backend, mem_type=kind))
             if len(answers) != len(rows):
                 raise RuntimeError("query_memory answered the wrong number of rows")
-            results = ["absent" if answer is None else "present" for answer in answers]
+            results = [
+                "present" if self._present(answer) else "absent" for answer in answers
+            ]
             error = ""
         except Exception as caught:
             logger.debug("KVCR G4 existence check failed", exc_info=True)
@@ -611,9 +623,22 @@ class _CheckWorker:
             job.error = error
             g4._check_done.put(job)
 
+    def _present(self, answer: Any) -> bool:
+        if answer is None:
+            return False
+        if self._g4._flavor == "object":
+            return True
+        # The POSIX query answers stat fields as decimal strings.
+        try:
+            size = int(answer["size"])
+            mode = int(answer["mode"])
+        except (KeyError, TypeError, ValueError):
+            return False
+        return size == self._g4._payload_len and stat.S_ISREG(mode)
+
 
 class _FileWorker:
-    """Runs every file system call of the file flavor, in queue order."""
+    """Runs the file flavor's file system calls and read re-checks, in queue order."""
 
     def __init__(self, g4: "_G4") -> None:
         self._g4 = g4
@@ -678,6 +703,7 @@ class _FileWorker:
         g4._op_done.put(xfer)
 
     def _check(self, job: _CheckJob) -> None:
+        """Answer whether the file a read used is still the one in place."""
         try:
             info = os.stat(job.name)
         except FileNotFoundError:
@@ -686,14 +712,8 @@ class _FileWorker:
             job.result = "error"
             job.error = str(error)
         else:
-            if job.probe_op is not None:
-                # A probe asks whether the read file is still the one in place.
-                same = (info.st_dev, info.st_ino) == job.file_id
-                job.result = "present" if same else "absent"
-            elif stat.S_ISREG(info.st_mode) and info.st_size == self._g4._payload_len:
-                job.result = "present"
-            else:
-                job.result = "absent"
+            same = (info.st_dev, info.st_ino) == job.file_id
+            job.result = "present" if same else "absent"
         self._g4._check_done.put(job)
 
     def _open(self, xfer: _Xfer) -> None:
@@ -897,7 +917,7 @@ class _G4:
             0,
         )
         self._storage = _StorageWorker(self)
-        self._checker = _CheckWorker(self) if self._flavor == "object" else None
+        self._checker = _CheckWorker(self)
         self._file = _FileWorker(self) if self._flavor == "file" else None
 
     # Startup and naming.
@@ -984,7 +1004,7 @@ class _G4:
                 )
 
     def _agent_workers(self) -> list["_StorageWorker | _CheckWorker"]:
-        return [self._storage] + ([self._checker] if self._checker else [])
+        return [self._storage, self._checker]
 
     def start(self, timeout: float) -> None:
         for worker in (*self._agent_workers(), self._file):
@@ -1159,12 +1179,8 @@ class _G4:
         jobs, self._outbox = self._outbox, []
         if not jobs:
             return
-        if self._flavor == "file":
-            for job in jobs:
-                self._file.queue.put(job)
-        else:
-            # One hand-off, so the worker batches them into full calls.
-            self._checker.submit(jobs)
+        # One hand-off, so the worker batches them into full calls.
+        self._checker.submit(jobs)
 
     def lookup(
         self, key: BlockKey, owner: str | None

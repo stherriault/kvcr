@@ -210,14 +210,14 @@ def _remove(w, key) -> None:
 
 def _read_error_on_a_vanished_block(w, key, rid) -> None:
     """Fail a held read with ERR after the block is gone; wait for its probe."""
-    probes = len(w.check_names())
+    probes = w.probe_calls()
     w.storage.outcome["READ"] = "HOLD"
     handle = w.deliver(key, 4, rid)
     wait_for(lambda: len(w.storage.held("READ")) == 1)
     _remove(w, key)
     w.storage.finish_all("ERR")
     assert not w.wait(handle)[key].success
-    wait_for(lambda: len(w.check_names()) > probes)
+    wait_for(lambda: w.probe_calls() > probes)
     w.settle(50)
 
 

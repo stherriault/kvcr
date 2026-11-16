@@ -610,6 +610,17 @@ def _rename_over(path):
     os.replace(other, path)
 
 
+def test_g4_file_read_error_recheck_stats_the_path_and_skips_the_nixl_query(
+    g4env, tmp_path
+):
+    w = new_world(g4env, tmp_path, flavor="file", failure_threshold=1)
+    _file_read_error(w)
+    queries = w.check_calls()
+    wait_for(lambda: len(w.stat_log) > w.stats_before)
+    w.settle(20)
+    assert w.check_calls() == queries
+
+
 def test_g4_file_read_error_on_an_absent_file_does_not_count(g4env, tmp_path):
     w = new_world(g4env, tmp_path, flavor="file", failure_threshold=1)
     _file_read_error(w, _unlink)

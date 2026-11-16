@@ -234,6 +234,24 @@ def test_g4_file_flavor_runs_one_file_worker_thread_until_close(g4env, tmp_path)
     assert threading.active_count() == threads
 
 
+def _check_workers():
+    return [
+        t for t in threading.enumerate() if t.name == "kvcr-g4-check" and t.is_alive()
+    ]
+
+
+@pytest.mark.parametrize("flavor", ["object", "file"])
+def test_g4_check_worker_thread_runs_for_each_flavor_until_close(
+    g4env, tmp_path, flavor
+):
+    threads = threading.active_count()
+    w = new_world(g4env, tmp_path, flavor=flavor)
+    assert len(_check_workers()) == 1
+    w.kvcr.close()
+    assert _check_workers() == []
+    assert threading.active_count() == threads
+
+
 # ---- A worker that dies, or fails on one job ----
 
 D = BlockKey(b"block-d")
@@ -379,8 +397,11 @@ def test_g4_storage_worker_crash_before_the_post_frees_the_fill_slot(g4env, tmp_
         w.abandon()
 
 
-def test_g4_check_worker_crash_lets_an_in_flight_read_finish(g4env, tmp_path, caplog):
-    w = new_world(g4env, tmp_path, flavor="object")
+@pytest.mark.parametrize("flavor", ["object", "file"])
+def test_g4_check_worker_crash_lets_an_in_flight_read_finish(
+    g4env, tmp_path, caplog, flavor
+):
+    w = new_world(g4env, tmp_path, flavor=flavor)
     caplog.set_level(logging.WARNING)
     try:
         handle = _held_read(w)
@@ -400,8 +421,9 @@ def test_g4_check_worker_crash_lets_an_in_flight_read_finish(g4env, tmp_path, ca
         w.abandon()
 
 
-def test_g4_check_worker_crash_lets_an_in_flight_fill_complete(g4env, tmp_path):
-    w = new_world(g4env, tmp_path, flavor="object")
+@pytest.mark.parametrize("flavor", ["object", "file"])
+def test_g4_check_worker_crash_lets_an_in_flight_fill_complete(g4env, tmp_path, flavor):
+    w = new_world(g4env, tmp_path, flavor=flavor)
     try:
         handle = _held_fill(w)
         w.storage.fault = crash_on("query_memory")

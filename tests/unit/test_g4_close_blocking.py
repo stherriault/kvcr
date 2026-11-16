@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""The G4 storage worker blocked inside query_memory: close and breaker."""
+"""The G4 check worker blocked inside query_memory: close and breaker."""
 
 import atexit
 import threading
@@ -33,11 +33,12 @@ def _hung_check(w):
     return w.storage.query_gate
 
 
+@pytest.mark.parametrize("flavor", ["object", "file"])
 def test_g4_close_waits_out_a_blocking_query_within_its_bound(
-    g4env, tmp_path, short_bounds
+    g4env, tmp_path, flavor, short_bounds
 ):
     threads = threading.active_count()
-    w = new_world(g4env, tmp_path, flavor="object")
+    w = new_world(g4env, tmp_path, flavor=flavor)
     gate = _hung_check(w)
     # Past the cleanup and join bounds, inside the per-row query bound.
     timer = threading.Timer(0.5, gate.set)
@@ -51,14 +52,15 @@ def test_g4_close_waits_out_a_blocking_query_within_its_bound(
     assert threading.active_count() == threads
 
 
+@pytest.mark.parametrize("flavor", ["object", "file"])
 def test_g4_close_past_the_query_bound_raises_and_joins_at_exit(
-    g4env, tmp_path, short_bounds, monkeypatch
+    g4env, tmp_path, flavor, short_bounds, monkeypatch
 ):
     hooks = []
     monkeypatch.setattr(
         atexit, "register", lambda func, *args, **kwargs: hooks.append((func, args))
     )
-    w = new_world(g4env, tmp_path, flavor="object")
+    w = new_world(g4env, tmp_path, flavor=flavor)
     gate = _hung_check(w)
     with pytest.raises(RuntimeError, match="storage worker did not stop"):
         w.kvcr.close()
@@ -80,8 +82,9 @@ def test_g4_close_timeout_ms_defaults_to_thirty_seconds():
     assert options.close_timeout_ms == 30_000
 
 
+@pytest.mark.parametrize("flavor", ["object", "file"])
 def test_g4_close_gives_up_on_a_blocked_call_after_close_timeout_ms(
-    g4env, tmp_path, short_bounds, monkeypatch
+    g4env, tmp_path, flavor, short_bounds, monkeypatch
 ):
     # The per-row query bound alone would keep close waiting for 3 s.
     monkeypatch.setattr(unmanaged_storage, "_QUERY_SECONDS_PER_ROW", 3.0)
@@ -89,7 +92,7 @@ def test_g4_close_gives_up_on_a_blocked_call_after_close_timeout_ms(
     monkeypatch.setattr(
         atexit, "register", lambda func, *args, **kwargs: hooks.append((func, args))
     )
-    w = new_world(g4env, tmp_path, flavor="object", close_timeout_ms=400)
+    w = new_world(g4env, tmp_path, flavor=flavor, close_timeout_ms=400)
     gate = _hung_check(w)
     started = time.monotonic()
     with pytest.raises(RuntimeError, match="storage worker did not stop"):
@@ -104,10 +107,11 @@ def test_g4_close_gives_up_on_a_blocked_call_after_close_timeout_ms(
     _OPEN_KVCRS.remove(w.kvcr)
 
 
+@pytest.mark.parametrize("flavor", ["object", "file"])
 def test_g4_close_reports_no_error_when_the_worker_exits_as_the_block_clears(
-    g4env, tmp_path, short_bounds, monkeypatch
+    g4env, tmp_path, flavor, short_bounds, monkeypatch
 ):
-    w = new_world(g4env, tmp_path, flavor="object")
+    w = new_world(g4env, tmp_path, flavor=flavor)
     gate = _hung_check(w)
     # A second check waits behind the blocked one; the worker cancels it on
     # its way out, which keeps the thread alive just after the call returns.
@@ -129,10 +133,11 @@ def test_g4_close_reports_no_error_when_the_worker_exits_as_the_block_clears(
     assert w.kvcr._core.is_quiescent()
 
 
+@pytest.mark.parametrize("flavor", ["object", "file"])
 def test_g4_opening_the_breaker_cancels_timed_out_checks_queued_behind_a_hung_call(
-    g4env, tmp_path
+    g4env, tmp_path, flavor
 ):
-    w = new_world(g4env, tmp_path, flavor="object", failure_threshold=2)
+    w = new_world(g4env, tmp_path, flavor=flavor, failure_threshold=2)
     keys = [BlockKey(b"queued-%d" % i) for i in range(3)]
     gate = _hung_check(w)
     assert w.kvcr.query(keys, "r") == [fetching_g4()] * 3

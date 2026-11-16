@@ -62,8 +62,8 @@ PREFIX = "kvcr/unit/model-a/base/bf16"
 ERROR_XML = b"<Error><Code>NoSuchKey</Code></Error>"
 FAKE_MODULE = "kvcr_unit_fake_nixl"
 WAIT_SECONDS = 3.0
-# What a failing check reports, per flavor (the file flavor fails with EIO).
-CHECK_ERROR_TEXT = {"object": "endpoint down", "file": "check failed"}
+# What a failing check reports.
+CHECK_ERROR_TEXT = {"object": "endpoint down", "file": "endpoint down"}
 
 
 _PROBES = itertools.count()
@@ -168,7 +168,9 @@ class FakeG4Agent:
     The agent named ``<agent>-g4`` carries transfers. A second agent created
     for the check worker is a peer: it records its own calls and threads but
     answers query_memory from the first agent's store and knobs, so one set of
-    knobs steers every existence check.
+    knobs steers every existence check. An OBJ query answers from the object
+    store; a FILE query answers like the POSIX file query, from the real files
+    under the path: a dict of string size, mode and mtime, or None if missing.
     """
 
     def __init__(
@@ -196,6 +198,8 @@ class FakeG4Agent:
         self.xfers: dict[int, _Xfer] = {}
         self.released: list[int] = []
         self.query_calls: list[tuple[str, ...]] = []
+        self.query_rows: list[tuple[tuple[Any, ...], ...]] = []
+        self.query_types: list[tuple[str | None, str]] = []
         self.query_blocked = 0
         self.query_gate: threading.Event | None = None
         self.query_error: Exception | None = None
@@ -289,12 +293,32 @@ class FakeG4Agent:
 
     def query_memory(self, reg_list, backend, mem_type=None):
         self._record("query_memory")
-        return (self.primary or self)._answer(reg_list)
+        return (self.primary or self)._answer(reg_list, backend, mem_type)
 
-    def _answer(self, reg_list):
+    def forget_queries(self) -> None:
+        with self._lock:
+            self.query_calls.clear()
+            self.query_rows.clear()
+            self.query_types.clear()
+
+    @staticmethod
+    def _file_answer(path):
+        try:
+            info = os.lstat(path)
+        except FileNotFoundError:
+            return None
+        return {
+            "size": str(info.st_size),
+            "mode": str(info.st_mode),
+            "mtime": str(int(info.st_mtime)),
+        }
+
+    def _answer(self, reg_list, backend=None, mem_type=None):
         rows = [tuple(row) for row in reg_list]
         with self._lock:
             self.query_calls.append(tuple(str(row[3]) for row in rows))
+            self.query_rows.append(tuple(rows))
+            self.query_types.append((mem_type, str(backend)))
         gate = self.query_gate
         if gate is not None and not gate.is_set():
             with self._lock:
@@ -310,6 +334,8 @@ class FakeG4Agent:
             tuple(str(row[3]) for row in rows)
         ):
             raise RuntimeError("batch rejected")
+        if mem_type == "FILE":
+            return [self._file_answer(str(row[3])) for row in rows]
         return [{} if row[3] in self.store.objects else None for row in rows]
 
     def get_xfer_descs(self, descs, mem_type=None):
@@ -750,7 +776,11 @@ class World:
             self.store.objects[name] = pattern(0, self.piece)
 
     def install_stat_spy(self) -> None:
-        """File flavor: record, gate and fail the existence checks (stat calls)."""
+        """File flavor: spy os.stat on block paths (not on the test thread).
+
+        Existence checks go through the NIXL file query, so only the re-check
+        after a failed read reaches os.stat.
+        """
         self.stat_gate = None
         self.stat_blocked = 0
         self.stat_log: list[str] = []
@@ -781,40 +811,33 @@ class World:
         """Block every existence check until the returned event is set."""
         gate = threading.Event()
         self.env.gates.append(gate)
-        if self.flavor == "object":
-            self.storage.query_gate = gate
-        else:
-            self.stat_gate = gate
+        self.storage.query_gate = gate
         return gate
 
     def blocked_checks(self) -> int:
-        return (
-            self.storage.query_blocked if self.flavor == "object" else self.stat_blocked
-        )
+        """Checks held in query_memory, plus read re-checks held in os.stat."""
+        blocked = self.storage.query_blocked
+        return blocked + self.stat_blocked if self.flavor == "file" else blocked
 
     def check_names(self) -> list[str]:
         """Digests of the keys checked so far, in call order."""
-        if self.flavor == "file":
-            return list(self.stat_log)
         return [n.split("/")[-1] for call in self.storage.query_calls for n in call]
 
+    def probe_calls(self) -> int:
+        """Re-checks after a failed read: os.stat on the file flavor, a query on OBJ."""
+        if self.flavor == "file":
+            return len(self.stat_log)
+        return len(self.check_names())
+
     def check_calls(self) -> int:
-        """Storage calls made for checks (a batch is one call on OBJ)."""
-        if self.flavor == "object":
-            return len(self.storage.query_calls)
-        return len(self.stat_log)
+        """query_memory calls made for checks (a batch is one call)."""
+        return len(self.storage.query_calls)
 
     def fail_checks(self) -> None:
-        if self.flavor == "object":
-            self.storage.query_error = RuntimeError(CHECK_ERROR_TEXT["object"])
-        else:
-            self.stat_error = True
+        self.storage.query_error = RuntimeError(CHECK_ERROR_TEXT[self.flavor])
 
     def heal_checks(self) -> None:
-        if self.flavor == "object":
-            self.storage.query_error = None
-        else:
-            self.stat_error = False
+        self.storage.query_error = None
 
     def query_only(self, key: BlockKey, rid: str = "r"):
         """Wait for a check result using query alone, never poll_completed."""
@@ -985,7 +1008,7 @@ def new_world(
     world.kvcr._core._clock = lambda: world.now[0]
     # A startup existence check is not one of the test's own checks.
     world.startup_queries = list(world.storage.query_calls)
-    world.storage.query_calls.clear()
+    world.storage.forget_queries()
     if flavor == "file" and world.root is not None:
         world.install_stat_spy()
     return world
@@ -1067,6 +1090,7 @@ def new_hybrid_world(
     )
     world.kvcr._core._clock = lambda: world.now[0]
     world.layout = tuple(key_layout)
+    world.storage.forget_queries()
     if flavor == "file":
         world.install_stat_spy()
     return world
