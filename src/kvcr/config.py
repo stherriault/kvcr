@@ -67,7 +67,8 @@ class G4Options(msgspec.Struct, frozen=True, kw_only=True):
 
     Every block in ``key_prefix`` is one file holding the pieces of
     ``key_layout`` back to back. Hosts share blocks only when they use the same
-    ``key_layout`` labels and pool block sizes.
+    ``key_layout`` labels and pool block sizes. ``None`` timeouts default to
+    ``KVCRConfig.operation_timeout_ms``.
     """
 
     flavor: Literal["file"]
@@ -76,6 +77,9 @@ class G4Options(msgspec.Struct, frozen=True, kw_only=True):
     root: Path | None = None
     backend: str = ""
     backend_options: Mapping[str, str] = msgspec.field(default_factory=dict)
+    max_inflight_checks: int = 64
+    max_check_results: int = 65_536
+    check_timeout_ms: int | None = None
 
 
 class KVCRBackendConfigs(msgspec.Struct, frozen=True):

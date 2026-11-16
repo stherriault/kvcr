@@ -44,6 +44,7 @@ from kvcr.types import (
     BlockKey,
     CacheTier,
     PlacementAction,
+    QueryStatus,
     RegionDescriptor,
 )
 
@@ -59,12 +60,25 @@ FAKE_MODULE = "kvcr_unit_fake_nixl"
 WAIT_SECONDS = 3.0
 
 
+def fetching_g4():
+    return (QueryStatus.FETCHING, CacheTier.G4)
+
+
 def aligned(size: int):
     """Page-aligned ctypes buffer (O_DIRECT needs aligned memory)."""
     mapping = mmap.mmap(-1, size)
     buffer = (ctypes.c_char * size).from_buffer(mapping)
     buffer._mapping = mapping
     return buffer
+
+
+def wait_for(predicate: Callable[[], bool], *, timeout: float = WAIT_SECONDS) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        time.sleep(0.001)
+    raise AssertionError("condition was not reached")
 
 
 def digest(key: BlockKey) -> str:
@@ -540,6 +554,17 @@ class World:
             time.sleep(0.001)
         return self.results[handle]
 
+    def await_check(self, key: BlockKey, rid: str = "r"):
+        deadline = time.monotonic() + WAIT_SECONDS
+        while True:
+            status = self.kvcr.query([key], rid)[0]
+            if status[0] is not QueryStatus.FETCHING:
+                return status
+            if time.monotonic() > deadline:
+                raise AssertionError("existence check did not finish")
+            self.poll()
+            time.sleep(0.001)
+
     def install_stat_spy(self) -> None:
         """File flavor: record, gate and fail the existence checks (stat calls)."""
         self.stat_gate = None
@@ -567,6 +592,20 @@ class World:
             return real(path, *args, **kwargs)
 
         self.env.monkeypatch.setattr(os, "stat", spy)
+
+    def hold_checks(self) -> threading.Event:
+        """Block every existence check until the returned event is set."""
+        gate = threading.Event()
+        self.env.gates.append(gate)
+        self.stat_gate = gate
+        return gate
+
+    def blocked_checks(self) -> int:
+        return self.stat_blocked
+
+    def check_names(self) -> list[str]:
+        """Digests of the keys checked so far, in call order."""
+        return list(self.stat_log)
 
     @property
     def local_dram(self):
@@ -694,6 +733,8 @@ __all__ = [
     "PREFIX",
     "World",
     "build_kvcr",
+    "fetching_g4",
     "g4_options",
     "new_world",
+    "wait_for",
 ]

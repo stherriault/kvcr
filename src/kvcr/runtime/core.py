@@ -522,7 +522,23 @@ class _KVCRCore:
 
         Exact hint membership is used unless opportunistic querying is enabled.
         Usable remote selections persist until successful fetch or discard_hint.
+        A key no other tier holds starts or joins a G4 existence check.
         """
+        g4 = self._g4
+        if g4 is None:
+            return self._query(keys, request_id)
+        with self._state_lock:
+            g4.refresh()
+            try:
+                return self._query(keys, request_id)
+            finally:
+                g4.submit_checks()
+
+    def _query(
+        self,
+        keys: Collection[BlockKey],
+        request_id: str | None,
+    ) -> list[tuple[QueryStatus, CacheTier | None]]:
         statuses = []
         remote_keys = self._remote_delivery_keys.get(request_id, ())
         for key in keys:
@@ -565,6 +581,8 @@ class _KVCRCore:
                         request_id, set()
                     )
                 remote_keys.add(key)
+            elif self._g4 is not None:
+                statuses.append(self._g4.lookup(key, request_id))
             else:
                 statuses.append((QueryStatus.MISS, None))
         if self._query_diagnostics is not None:
@@ -655,6 +673,7 @@ class _KVCRCore:
             with self._state_lock:
                 local_blocks: dict[BlockKey, list[_TransferRef]] = {}
                 g3_blocks: dict[BlockKey, list[_TransferRef]] = {}
+                g4_blocks: dict[BlockKey, list[_TransferRef]] = {}
                 remote_blocks: dict[BlockKey, list[_TransferRef]] = {}
                 # Record pending-removal failures while other keys proceed.
                 rejected: dict[BlockKey, OpEntryResult] = {}
@@ -672,6 +691,10 @@ class _KVCRCore:
                         local_blocks[key] = destination
                     elif self._g3 is not None and self._g3.is_ready(key):
                         g3_blocks[key] = destination
+                    elif self._g4 is not None and self._g4.take_read_source(
+                        key, request_id, [ref.label for ref in destination]
+                    ):
+                        g4_blocks[key] = destination
                     else:
                         remote_blocks[key] = destination
 
@@ -683,7 +706,18 @@ class _KVCRCore:
                         g3_blocks=len(g3_blocks),
                     )
                 if (
-                    sum(map(bool, (local_blocks, g3_blocks, remote_blocks, rejected)))
+                    sum(
+                        map(
+                            bool,
+                            (
+                                local_blocks,
+                                g3_blocks,
+                                g4_blocks,
+                                remote_blocks,
+                                rejected,
+                            ),
+                        )
+                    )
                     > 1
                 ):
                     self._joined_completions[op_handle] = (set(blocks), {})
@@ -699,6 +733,8 @@ class _KVCRCore:
                         op_handle,
                         dict.fromkeys(g3_blocks, _FAILED_RESULT),
                     )
+                if g4_blocks:
+                    self._g4.start_deliver(op_handle, g4_blocks, deadline)
                 if remote_blocks:
                     self._remote_fw_dram.deliver(
                         op_handle, remote_blocks, request_id, deadline=deadline
@@ -842,6 +878,10 @@ class _KVCRCore:
                     key, request_id
                 ):
                     sources[key] = CacheTier.REMOTE_G2
+                elif self._g4 is not None and self._g4.take_fill_source(
+                    key, request_id, requested
+                ):
+                    sources[key] = CacheTier.G4
             deadline = self._operation_deadline()
             if move:
                 # Accept delayed completion using the existing abandonment budget.
@@ -860,7 +900,7 @@ class _KVCRCore:
                 key_layout=declaration,
                 named_source=named_source,
             )
-            for source in (CacheTier.G3, CacheTier.REMOTE_G2):
+            for source in (CacheTier.G3, CacheTier.REMOTE_G2, CacheTier.G4):
                 self._start_local_fill(
                     source,
                     {
@@ -892,6 +932,8 @@ class _KVCRCore:
             if not self._closed:
                 if self._g3 is not None:
                     progress_items = self._g3.poll_main(progress_items)
+                if self._g4 is not None:
+                    self._g4.poll_main()
                 if self._local_dram is not None:
                     progress_items = self._local_dram.poll_main(progress_items)
                 self._remote_fw_dram.poll_main(progress_items)
@@ -1031,6 +1073,8 @@ class _KVCRCore:
         run(self._close_hint_handlers)
         # Native work has stopped; abandon pending removals without waiting.
         run(self._invalidation_handler.close)
+        if self._g4 is not None:
+            run(self._g4.close_main)
         if self._g3 is not None:
             run(self._g3.close_main)
         if self._local_dram is not None:
@@ -1202,6 +1246,10 @@ class _KVCRCore:
                 fill_handle,
                 blocks,
                 deadline,
+            )
+        elif source is CacheTier.G4:
+            started = self._g4 is not None and self._g4.start_fill(
+                fill_handle, blocks, deadline
             )
         elif source is CacheTier.REMOTE_G2:
             # Independent operations retain their named source across deferral.

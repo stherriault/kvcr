@@ -560,7 +560,13 @@ class _LocalDram:
                 )
         return None
 
-    def complete_fill(self, keys: Collection[BlockKey], *, success: bool) -> None:
+    def complete_fill(
+        self,
+        keys: Collection[BlockKey],
+        *,
+        success: bool,
+        source: CacheTier = CacheTier.REMOTE_G2,
+    ) -> None:
         ordered_keys = tuple(keys)
         indices = []
         for key in ordered_keys:
@@ -569,9 +575,7 @@ class _LocalDram:
             if residency is None or residency.remote_indices is None:
                 raise RuntimeError(f"local DRAM fill state lost for {key!r}")
             indices.append(residency.remote_indices)
-        self._apply_fill_result(
-            ordered_keys, tuple(indices), success, CacheTier.REMOTE_G2
-        )
+        self._apply_fill_result(ordered_keys, tuple(indices), success, source)
 
     def deliver(
         self,
