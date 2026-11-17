@@ -321,6 +321,8 @@ class _StorageWorker:
         self._dram_regs: list[Any] = []
         self._next_devid = _OBJ_DEVID_BASE
         self._next_batch = 0
+        # Spill directories made this run; at most 256 per layout.
+        self._made_dirs: set[str] = set()
         self.thread = threading.Thread(
             target=self._run, daemon=True, name="kvcr-g4-storage"
         )
@@ -549,12 +551,7 @@ class _StorageWorker:
         direct = os.O_DIRECT if g4._options.direct_io else 0
         if xfer.op.kind == "spill":
             try:
-                g4._make_dirs(os.path.dirname(xfer.name))
-                xfer.fd = os.open(
-                    xfer.tmp,
-                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | direct,
-                    0o644,
-                )
+                xfer.fd = self._open_temp(xfer.tmp, direct)
                 os.ftruncate(xfer.fd, g4._payload_len)
             except OSError:
                 logger.warning("KVCR G4 spill file could not open", exc_info=True)
@@ -587,6 +584,24 @@ class _StorageWorker:
             self._finish(xfer)
             return False
         return True
+
+    def _open_temp(self, tmp: str, direct: int) -> int:
+        """Create a spill's temp file, making its directory once per run."""
+        directory = os.path.dirname(tmp)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | direct
+        if directory in self._made_dirs:
+            try:
+                return os.open(tmp, flags, 0o644)
+            except OSError as error:
+                # Storage-side cleanup may have removed the directory; NFS can
+                # answer that with ESTALE, so the next spill makes it again.
+                self._made_dirs.discard(directory)
+                if not isinstance(error, FileNotFoundError):
+                    raise
+        self._g4._make_dirs(directory)
+        fd = os.open(tmp, flags, 0o644)
+        self._made_dirs.add(directory)
+        return fd
 
     def _close_fd(self, xfer: _Xfer) -> None:
         if xfer.fd is not None and not xfer.fd_closed:

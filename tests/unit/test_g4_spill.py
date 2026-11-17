@@ -838,3 +838,87 @@ def test_g4_opening_the_breaker_drops_checks_that_have_not_started(
     gate.set()
     w.settle()
     assert w.check_names() == [digest(A)]
+
+
+# ---- Fan-out directories: created once, recreated if removed ----
+
+
+def _same_fanout_keys(count: int) -> list[BlockKey]:
+    keys = [BlockKey(b"fanout-0")]
+    index = 1
+    while len(keys) < count:
+        key = BlockKey(b"fanout-%d" % index)
+        if digest(key)[:2] == digest(keys[0])[:2]:
+            keys.append(key)
+        index += 1
+    return keys
+
+
+def _spy_mkdir(w, monkeypatch) -> list[str]:
+    me = threading.get_ident()
+    real = os.mkdir
+    calls: list[str] = []
+
+    def spy(path, *args, **kwargs):
+        text = os.fspath(path)
+        if threading.get_ident() != me and text.startswith(str(w.root)):
+            calls.append(text)
+        return real(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "mkdir", spy)
+    return calls
+
+
+def test_g4_spills_into_one_fanout_directory_create_it_once(
+    g4env, tmp_path, monkeypatch
+):
+    w = new_world(g4env, tmp_path, flavor="file")
+    calls = _spy_mkdir(w, monkeypatch)
+    keys = _same_fanout_keys(3)
+    for index, key in enumerate(keys):
+        w.spill(key, index)
+    fanout = str(find_files(w.root, keys[0])[0].parent)
+    assert calls.count(fanout) == 1
+    assert all(w.stored(key) for key in keys)
+
+
+def test_g4_spill_recreates_a_fanout_directory_removed_by_storage_cleanup(
+    g4env, tmp_path, monkeypatch
+):
+    w = new_world(g4env, tmp_path, flavor="file")
+    first, second = _same_fanout_keys(2)
+    w.spill(first, 0)
+    (path,) = find_files(w.root, first)
+    path.unlink()
+    path.parent.rmdir()
+    w.spill(second, 1)
+    assert w.stored(second)
+    assert tmp_files(w.root) == []
+
+
+def test_g4_temp_open_error_makes_the_next_open_recreate_its_directory(
+    g4env, tmp_path, monkeypatch
+):
+    w = new_world(g4env, tmp_path, flavor="file")
+    w.spill(A, 0)
+    fanout = find_files(w.root, A)[0].parent
+    worker = w.kvcr._core._g4._storage
+    real_open, real_mkdir = os.open, os.mkdir
+    made: list[str] = []
+
+    def stale(path, *args, **kwargs):
+        raise OSError(errno.ESTALE, "stale file handle", os.fspath(path))
+
+    def spy(path, *args, **kwargs):
+        made.append(os.fspath(path))
+        return real_mkdir(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "mkdir", spy)
+    monkeypatch.setattr(os, "open", stale)
+    with pytest.raises(OSError, match="stale"):
+        worker._open_temp(str(fanout / "x.tmp.1"), 0)
+    assert made == []
+    monkeypatch.setattr(os, "open", real_open)
+    os.close(worker._open_temp(str(fanout / "x.tmp.2"), 0))
+    assert made == [str(fanout)]
+    (fanout / "x.tmp.2").unlink()
