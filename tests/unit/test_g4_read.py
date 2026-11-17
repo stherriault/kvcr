@@ -1002,3 +1002,28 @@ def test_g4_file_direct_io_mode_sets_o_direct_and_round_trips(
     _present(w)
     assert w.wait(w.deliver(A, 4))[A].success
     assert w.element(4) == pattern(0, w.piece)
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [{}, {"mode": "33188"}, {"size": "8", "mode": "rw"}, "not a dict"],
+    ids=["empty", "no-size", "bad-mode", "not-a-dict"],
+)
+def test_g4_malformed_file_query_answer_is_a_check_error(
+    g4env, tmp_path, monkeypatch, answer
+):
+    w = new_world(g4env, tmp_path, flavor="file", failure_threshold=2)
+    monkeypatch.setattr(w.storage, "_file_answer", lambda path: answer)
+    assert w.await_check(A) == (QueryStatus.MISS, None)
+    assert not w.breaker_open()
+    assert w.await_check(B) == (QueryStatus.MISS, None)
+    assert w.breaker_open()
+
+
+def test_g4_file_query_answers_of_absent_blocks_keep_the_breaker_closed(
+    g4env, tmp_path
+):
+    w = new_world(g4env, tmp_path, flavor="file", failure_threshold=2)
+    assert w.await_check(A) == (QueryStatus.MISS, None)
+    assert w.await_check(B) == (QueryStatus.MISS, None)
+    assert not w.breaker_open()

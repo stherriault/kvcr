@@ -684,31 +684,32 @@ class _StorageWorker:
             answers = list(self.agent.query_memory(rows, g4._backend, mem_type=kind))
             if len(answers) != len(rows):
                 raise RuntimeError("query_memory answered the wrong number of rows")
-            results = [
-                "present" if self._present(answer) else "absent" for answer in answers
-            ]
-            error = ""
+            results = [self._result(answer) for answer in answers]
+            error = "query_memory answered a file row without a usable size and mode"
         except Exception as caught:
             logger.debug("KVCR G4 existence check failed", exc_info=True)
             results = ["error"] * len(rows)
             error = str(caught)
         for job, result in zip(jobs, results, strict=True):
             job.result = result
-            job.error = error
+            job.error = error if result == "error" else ""
             g4._check_done.put(job)
 
-    def _present(self, answer: Any) -> bool:
+    def _result(self, answer: Any) -> str:
         if answer is None:
-            return False
+            return "absent"
         if self._g4._flavor == "object":
-            return True
-        # The POSIX query answers stat fields as decimal strings.
+            return "present"
+        # The POSIX query answers stat fields as decimal strings; anything
+        # else means the query itself is broken, so it counts as an error.
         try:
             size = int(answer["size"])
             mode = int(answer["mode"])
         except (KeyError, TypeError, ValueError):
-            return False
-        return size == self._g4._payload_len and stat.S_ISREG(mode)
+            return "error"
+        if size == self._g4._payload_len and stat.S_ISREG(mode):
+            return "present"
+        return "absent"
 
 
 class _G4:
