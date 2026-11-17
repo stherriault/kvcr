@@ -1588,10 +1588,12 @@ class _G4:
         worker.stop()
         if worker.thread.ident is not None:
             # close_timeout_ms bounds the whole wait, a blocked call included.
-            worker.thread.join(timeout=self._options.close_timeout_ms / 1000)
+            budget = self._options.close_timeout_ms / 1000
+            final = min(_FINAL_JOIN_SECONDS, budget / 2)
+            worker.thread.join(timeout=budget - final)
             if worker.thread.is_alive():
                 # A worker leaving its loop just as the wait ended is not stuck.
-                worker.thread.join(timeout=_FINAL_JOIN_SECONDS)
+                worker.thread.join(timeout=final)
         if worker.thread.is_alive():
             # Exiting while the agent's native threads still run aborts the
             # process; give the worker the cleanup budget again at exit.

@@ -178,3 +178,30 @@ def test_g4_close_gives_up_on_a_blocked_file_call_after_close_timeout_ms(
     w.kvcr.close()
     assert w.kvcr._core.is_quiescent()
     _OPEN_KVCRS.remove(w.kvcr)
+
+
+@pytest.mark.parametrize("flavor", ["object", "file"])
+def test_g4_close_waits_no_longer_than_close_timeout_ms_in_total(
+    g4env, tmp_path, flavor, short_bounds, monkeypatch
+):
+    monkeypatch.setattr(atexit, "register", lambda func, *args, **kwargs: None)
+    w = new_world(g4env, tmp_path, flavor=flavor, close_timeout_ms=400)
+    gate = _hung_check(w)
+    thread = w.kvcr._core._g4._storage.thread
+    join = thread.join
+    waits = []
+
+    def timed_join(timeout=None):
+        waits.append(timeout)
+        return join(timeout)
+
+    monkeypatch.setattr(thread, "join", timed_join)
+    with pytest.raises(RuntimeError, match="storage worker did not stop"):
+        w.kvcr.close()
+    assert None not in waits
+    assert sum(waits) <= 0.4 + 1e-9
+    monkeypatch.undo()
+    gate.set()
+    thread.join(5)
+    w.kvcr.close()
+    _OPEN_KVCRS.remove(w.kvcr)
